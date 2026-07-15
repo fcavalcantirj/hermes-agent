@@ -13,9 +13,56 @@ messages list so memory/skill review keep working. GitHub issue #25267.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Cap per persona/memory source so the append can't blow the context budget
+# (Hermes' native files are hard-capped anyway; the soul file is ours).
+_APPEND_SOURCE_MAX_CHARS = 8000
+
+
+def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()[:cap].strip()
+    except OSError:
+        return ""
+
+
+def build_system_prompt_append() -> Optional[str]:
+    """Compose the system-prompt append for the SDK session.
+
+    Sources, in order:
+      1. An operator-owned persona/soul file (HERMES_CLAUDE_SDK_APPEND_FILE)
+         — identity lives here; without it the agent introduces itself as
+         plain Claude Code.
+      2. Hermes' native memory files (~/.hermes/USER.md, MEMORY.md) — the
+         learning loop's bounded sticky notes, injected whole so the SDK
+         brain actually sees what Hermes has learned. (Hermes' own prompt
+         composer is bypassed on this runtime; this is its replacement.)
+
+    Read at session creation: edits apply on the next session (retire or
+    gateway restart), not mid-session.
+    """
+    parts: list[str] = []
+    soul_path = os.environ.get("HERMES_CLAUDE_SDK_APPEND_FILE", "").strip()
+    if soul_path:
+        soul = _read_capped(soul_path)
+        if soul:
+            parts.append(soul)
+        else:
+            logger.warning(
+                "HERMES_CLAUDE_SDK_APPEND_FILE=%s is set but unreadable/empty",
+                soul_path,
+            )
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    for filename, label in (("USER.md", "About the user"), ("MEMORY.md", "Working memory")):
+        content = _read_capped(os.path.join(hermes_home, filename))
+        if content:
+            parts.append(f"## {label} (Hermes memory — curated across sessions)\n{content}")
+    return "\n\n".join(parts) or None
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -188,6 +235,7 @@ def run_claude_agent_sdk_turn(
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,
+            system_prompt_append=build_system_prompt_append(),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the standard
