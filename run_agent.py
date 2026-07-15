@@ -5896,6 +5896,19 @@ class AIAgent:
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
+    def _run_claude_agent_sdk_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.claude_sdk_runtime.run_claude_agent_sdk_turn``."""
+        from agent.claude_sdk_runtime import run_claude_agent_sdk_turn
+        return run_claude_agent_sdk_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
 def main(
     query: str = None,
     model: str = "",
