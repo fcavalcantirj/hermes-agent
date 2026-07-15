@@ -445,6 +445,34 @@ class TestProviderWiring:
         assert _parse_api_mode("claude_agent_sdk") == "claude_agent_sdk"
 
 
+class TestSystemPromptAppend:
+    def test_soul_and_memory_composition(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("# I am the persona under test")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "USER.md").write_text("The user prefers concise results")
+        (hermes_home / "MEMORY.md").write_text("x" * 20000)  # over cap
+        monkeypatch.setenv("HERMES_CLAUDE_SDK_APPEND_FILE", str(soul))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        out = build_system_prompt_append()
+        assert out is not None
+        assert out.startswith("# I am the persona under test")
+        assert "The user prefers concise results" in out
+        # Capped sources cannot blow the context budget.
+        assert len(out) < 20000
+
+    def test_no_sources_returns_none(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # empty dir
+        assert build_system_prompt_append() is None
+
+
 class TestSdkAvailabilityGate:
     def test_check_reports_missing_sdk(self, monkeypatch):
         # RED-first negative control: with the import broken, the gate must
