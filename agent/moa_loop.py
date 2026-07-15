@@ -137,6 +137,36 @@ def _slot_reasoning_config(slot: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve the aggregator's reasoning config: slot value > global.
+
+    The aggregator is MoA's ACTING model, so when its slot doesn't pin a
+    reasoning_effort it must honor the user's global ``agent.reasoning_effort``
+    — the same knob that governs any other acting model. Without this
+    fallback the main loop's reasoning gates (keyed to the virtual
+    ``moa://local`` identity) never fire, so the aggregator silently ran at
+    the backend default regardless of config (#64187).
+
+    Reference advisors intentionally do NOT get this fallback: they are side
+    calls (like auxiliary tasks), and inheriting a global ``xhigh`` into every
+    advisor fan-out would silently multiply cost. Their depth is slot-or-
+    provider-default only.
+    """
+    cfg = _slot_reasoning_config(aggregator)
+    if cfg is not None:
+        return cfg
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import parse_reasoning_effort
+
+        # Raw value — a YAML boolean False means thinking disabled, see
+        # parse_reasoning_effort. Do NOT coerce with ``or ""``.
+        global_effort = (load_config().get("agent") or {}).get("reasoning_effort", "")
+        return parse_reasoning_effort(global_effort)
+    except Exception:  # pragma: no cover - defensive; bad config must not break MoA
+        return None
+
+
 def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """Resolve a reference/aggregator slot to real runtime call kwargs.
 
@@ -694,7 +724,7 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             max_tokens=max_tokens,
-            reasoning_config=_slot_reasoning_config(aggregator),
+            reasoning_config=_aggregator_reasoning_config(aggregator),
             **agg_runtime,
         )
         synthesis = _extract_text(response)
@@ -1089,7 +1119,7 @@ class MoAChatCompletions:
             max_tokens=agg_kwargs.get("max_tokens"),
             tools=agg_kwargs.get("tools"),
             extra_body=agg_kwargs.get("extra_body"),
-            reasoning_config=_slot_reasoning_config(aggregator),
+            reasoning_config=_aggregator_reasoning_config(aggregator),
             **stream_kwargs,
             **_slot_runtime(aggregator),
         )
