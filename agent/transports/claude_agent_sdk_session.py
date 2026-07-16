@@ -337,6 +337,12 @@ class ClaudeAgentSdkSession:
         }
         await self._client.query(text)
         async for message in self._client.receive_response():
+            # Capture the SDK session id from ANY message that carries it —
+            # the init SystemMessage announces it first, so even a turn
+            # interrupted before its ResultMessage keeps a resumable id.
+            early_sid = getattr(message, "session_id", None)
+            if early_sid:
+                self._session_id = early_sid
             if self._interrupt_event.is_set():
                 break
             if type(message).__name__ == "StreamEvent":

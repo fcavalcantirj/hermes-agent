@@ -70,6 +70,7 @@ class UserMessage:
 class SystemMessage:
     subtype: str = "init"
     data: dict = field(default_factory=dict)
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -624,6 +625,46 @@ class TestInterruptRoutesToSdkSession:
         assert instances == []  # no session created, no subscription burn
         assert result["completed"] is False and result["partial"] is True
         assert agent._interrupt_requested is False  # consumed, next turn runs
+
+    def test_honored_interrupt_consumes_agent_flag(self, monkeypatch):
+        # Live-gate catch: after an interrupt was honored mid-turn, the
+        # agent-level flag stayed set and the cold-flag check short-circuited
+        # the NEXT turn into an empty answer. Honoring must consume it.
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._session_db = None
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                agent._interrupt_requested = True  # user hit /stop mid-turn
+                return _make_turn(interrupted=True, final_text="", projected_messages=[])
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert result["partial"] is True
+        assert agent._interrupt_requested is False  # consumed — next turn runs
+
+    def test_thread_id_captured_from_init_message(self):
+        # A FIRST-turn interrupt used to lose the resume id (only the final
+        # ResultMessage carried it). The SDK announces session_id in its init
+        # SystemMessage — capture it from any message.
+        session, _ = _make_session(script=[SystemMessage(session_id="sdk-early-7")])
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.thread_id == "sdk-early-7"
 
     def test_pre_set_interrupt_event_honored_then_next_turn_runs(self):
         # Adversarial-review MEDIUM: run_turn unconditionally CLEARED the
