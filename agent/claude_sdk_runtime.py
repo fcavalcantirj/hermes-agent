@@ -353,6 +353,64 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _persisted_sdk_session_id(agent) -> Optional[str]:
+    """The SDK session id stored on the Hermes session row (or None)."""
+    if not (getattr(agent, "_session_db", None) and getattr(agent, "session_id", None)):
+        return None
+    try:
+        row = agent._session_db.get_session(agent.session_id) or {}
+        return row.get("claude_sdk_session_id") or None
+    except Exception:
+        logger.debug("resume-id read failed", exc_info=True)
+        return None
+
+
+def _store_sdk_session_id(agent, value: Optional[str]) -> None:
+    """Persist (or clear, with None) the SDK session id on the session row."""
+    if not (getattr(agent, "_session_db", None) and getattr(agent, "session_id", None)):
+        return
+    try:
+        agent._session_db.update_claude_sdk_session_id(agent.session_id, value)
+    except Exception:
+        logger.debug("resume-id write failed", exc_info=True)
+
+
+_CONTINUITY_DIGEST_MAX_CHARS = 4000
+
+
+def _render_continuity_digest(prior_messages: List[Dict[str, Any]]) -> str:
+    """Bounded text preamble for a FRESH SDK session that has prior Hermes
+    history (resume impossible: no stored id, or the stored one went stale).
+    Reuses _digest_history's compaction, then flattens to capped text."""
+    try:
+        from agent.background_review import _digest_history
+
+        msgs = _digest_history(list(prior_messages or []), tail=8)
+    except Exception:  # pragma: no cover - compaction is best-effort
+        msgs = list(prior_messages or [])[-8:]
+    lines: list[str] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not content:
+            continue
+        text = str(content).replace("\n", " ").strip()
+        if text:
+            lines.append(f"{role.upper()}: {text[:400]}")
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if len(body) > _CONTINUITY_DIGEST_MAX_CHARS:
+        body = body[-_CONTINUITY_DIGEST_MAX_CHARS:]
+    return (
+        "[Continuity digest — the runtime restarted and the live model "
+        "context was lost; recent turns from the stored transcript, oldest "
+        "first:]\n" + body + "\n[End digest. The user's new message follows.]\n\n"
+    )
+
+
 def run_claude_agent_sdk_turn(
     agent,
     *,
@@ -366,10 +424,17 @@ def run_claude_agent_sdk_turn(
     agent loop and projects its messages back into Hermes' list.
 
     Called from run_conversation() when agent.api_mode == "claude_agent_sdk".
-    Returns the same dict shape as the chat_completions path."""
+    Returns the same dict shape as the chat_completions path.
+
+    Continuity retire matrix (#25267):
+      /new, session expiry      → NEW Hermes session row → no persisted id → fresh
+      gateway restart/eviction  → same row, id persisted  → RESUME
+      error/timeout retire      → id CLEARED → next turn fresh + digest
+      stale/failed resume       → retire → clear → ONE fresh retry with digest
+    """
     from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
 
-    if not hasattr(agent, "_claude_sdk_session") or agent._claude_sdk_session is None:
+    def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
@@ -390,50 +455,86 @@ def run_claude_agent_sdk_turn(
                     "claude-sdk tool-progress callback raised", exc_info=True
                 )
 
+        append = build_system_prompt_append(
+            platform=getattr(agent, "platform", None),
+            session_id=getattr(agent, "session_id", None),
+            model=getattr(agent, "model", None),
+        )
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,
-            system_prompt_append=build_system_prompt_append(
-                platform=getattr(agent, "platform", None),
-                session_id=getattr(agent, "session_id", None),
-                model=getattr(agent, "model", None),
-            ),
+            system_prompt_append=append,
             hermes_session_id=getattr(agent, "session_id", None),
+            resume_session_id=resume_id,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the standard
     # run_conversation() flow before the early return reaches us. Do NOT
     # append again — that would duplicate. (Same contract as codex_runtime.)
 
-    try:
-        turn = agent._claude_sdk_session.run_turn(user_input=user_message)
-    except Exception as exc:
-        logger.exception("claude-agent-sdk turn failed")
-        try:
-            agent._claude_sdk_session.close()
-        except Exception:
-            pass
-        agent._claude_sdk_session = None
-        return {
-            "final_response": f"claude-agent-sdk turn failed: {exc}",
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "error": str(exc),
-        }
+    turn = None
+    resumed = False
+    send_text = user_message
+    for attempt in (0, 1):
+        if not hasattr(agent, "_claude_sdk_session") or agent._claude_sdk_session is None:
+            resume_id = _persisted_sdk_session_id(agent) if attempt == 0 else None
+            resumed = bool(resume_id)
+            send_text = user_message
+            if not resume_id and len(messages) > 1:
+                digest = _render_continuity_digest(messages[:-1])
+                if digest:
+                    send_text = digest + user_message
+            _create_session(resume_id)
 
-    if getattr(turn, "should_retire", False):
-        logger.warning(
-            "claude-agent-sdk session retired (turn error: %s)", turn.error
-        )
         try:
-            agent._claude_sdk_session.close()
-        except Exception:
-            pass
-        agent._claude_sdk_session = None
+            turn = agent._claude_sdk_session.run_turn(user_input=send_text)
+        except Exception as exc:
+            logger.exception("claude-agent-sdk turn failed")
+            try:
+                agent._claude_sdk_session.close()
+            except Exception:
+                pass
+            agent._claude_sdk_session = None
+            if resumed and attempt == 0:
+                # A raising RESUMED session is a suspect resume — clear the
+                # id and give the turn one fresh chance (digest included).
+                _store_sdk_session_id(agent, None)
+                resumed = False
+                continue
+            return {
+                "final_response": f"claude-agent-sdk turn failed: {exc}",
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "error": str(exc),
+            }
+
+        if getattr(turn, "should_retire", False):
+            logger.warning(
+                "claude-agent-sdk session retired (turn error: %s)", turn.error
+            )
+            try:
+                agent._claude_sdk_session.close()
+            except Exception:
+                pass
+            agent._claude_sdk_session = None
+            # Error/timeout retire always clears the persisted resume id —
+            # never resume a conversation that just failed.
+            _store_sdk_session_id(agent, None)
+            if resumed and attempt == 0:
+                # Stale/failed resume: one fresh retry with digest.
+                resumed = False
+                continue
+        break
+
+    if turn.final_text and not getattr(turn, "should_retire", False):
+        # Persist the SDK session id for restart/eviction resume.
+        thread_id = getattr(turn, "thread_id", None)
+        if thread_id:
+            _store_sdk_session_id(agent, thread_id)
 
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
