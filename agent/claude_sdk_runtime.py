@@ -65,6 +65,14 @@ _MEMORY_TOOL_DISAMBIGUATION = (
     "into future sessions; only the memory tool's store is."
 )
 
+# Observed live twice: models write "topic word word word" discovery queries;
+# FTS5 ANDs the terms and returns nothing for content that matches one
+# distinctive term. Appended after the verbatim native guidance.
+_SEARCH_QUERY_ADDENDUM = (
+    "session_search queries are keyword FTS: ALL terms must match (AND). "
+    "Prefer one or two distinctive words; join alternatives with OR."
+)
+
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
     return (
@@ -179,7 +187,7 @@ def build_system_prompt_append(
     try:
         from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
 
-        blocks.append(SESSION_SEARCH_GUIDANCE)
+        blocks.append(SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM)
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
 
