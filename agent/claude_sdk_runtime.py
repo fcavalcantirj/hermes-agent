@@ -4,7 +4,8 @@ The structural twin of ``agent/codex_runtime.py``'s app-server path: hands the
 entire turn to Anthropic's official ``claude-agent-sdk`` (which drives the
 Claude Code CLI's own agent loop under **subscription OAuth** — never a
 metered API key) and projects its typed message stream back into Hermes'
-messages list so memory/skill review keep working. GitHub issue #25267.
+messages list so transcript persistence and recall keep working. GitHub
+issue #25267.
 
 * ``run_claude_agent_sdk_turn`` — drives one turn through a lazily-created
   ``ClaudeAgentSdkSession`` (used when ``agent.api_mode == "claude_agent_sdk"``).
@@ -315,14 +316,19 @@ def run_claude_agent_sdk_turn(
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
-            )
-        except Exception:
-            logger.debug("background review spawn raised", exc_info=True)
+        # Deliberately NOT spawning the background review on this runtime:
+        # the fork inherits api_mode="claude_agent_sdk" and early-returns
+        # into a fresh SDK session whose tool surface has no `memory` /
+        # `skill_manage` — it would burn a subscription turn and be unable
+        # to write anything. The nudge counters above keep ticking so a
+        # bounded replacement pass can reuse them. (#25267)
+        logger.debug(
+            "claude-sdk runtime: background review skipped "
+            "(memory=%s, skills=%s) — the review fork cannot write on "
+            "this runtime",
+            should_review_memory,
+            should_review_skills,
+        )
 
     return {
         "final_response": turn.final_text,
