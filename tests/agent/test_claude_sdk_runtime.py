@@ -771,11 +771,20 @@ class TestSystemPromptAppend:
 
         def fake_index(**kwargs):
             captured.update(kwargs)
-            return "## Skills index\n- fixture-skill: proves the wiring"
+            # Includes the index's real unconditional boilerplate sentence —
+            # caught LIVE on the deployed box: the native index instructs
+            # skill_manage regardless of available_tools, and the strip must
+            # remove it (a tmp home's empty index made the old pin vacuous).
+            return (
+                "## Skills (mandatory)\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "- fixture-skill: proves the wiring"
+            )
 
         monkeypatch.setattr(pb, "build_skills_system_prompt", fake_index)
         out = build_system_prompt_append()
         assert "fixture-skill: proves the wiring" in out
+        assert "skill_manage" not in out
         tools = captured.get("available_tools") or set()
         assert "memory" in tools and "session_search" in tools
         assert set(EXPOSED_TOOLS) <= tools

@@ -39,18 +39,25 @@ def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
 # session_search guidance, skills index.
 _APPEND_TOTAL_MAX_CHARS = 20000
 
-# The one MEMORY_GUIDANCE sentence that instructs the skill tool —
-# skill_manage is NOT exposed through the MCP shims, and guidance must only
-# describe callable tools. Stripped as a pure deletion; the pin test goes
-# red if upstream rewords the sentence.
+# Sentences that instruct the skill-WRITE tool — skill_manage is NOT exposed
+# through the MCP shims, and guidance must only describe callable tools.
+# Stripped as pure deletions (never rewording); the pin tests go red if
+# upstream rewords them. One lives in MEMORY_GUIDANCE, one in the skills
+# index boilerplate (caught live: the index ships it unconditionally).
 _SKILL_TOOL_SENTENCE = (
     "If you've discovered a new way to do something, solved a problem that could be "
     "necessary later, save it as a skill with the skill tool.\n"
 )
+_SKILL_MANAGE_INDEX_SENTENCE = (
+    "If a skill has issues, fix it with skill_manage(action='patch')."
+)
 
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
-    return text.replace(_SKILL_TOOL_SENTENCE, "")
+    return (
+        text.replace(_SKILL_TOOL_SENTENCE, "")
+        .replace(_SKILL_MANAGE_INDEX_SENTENCE, "")
+    )
 
 
 def build_system_prompt_append(
@@ -169,7 +176,7 @@ def build_system_prompt_append(
             available_tools=set(EXPOSED_TOOLS) | {"memory", "session_search"},
         )
         if index:
-            blocks.append(index)
+            blocks.append(_strip_uncallable_tool_guidance(index))
     except Exception:  # pragma: no cover
         logger.debug("skills index composition failed", exc_info=True)
 
