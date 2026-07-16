@@ -155,6 +155,7 @@ class ClaudeAgentSdkSession:
         include_hermes_tools: bool = True,
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
+        on_stream_delta: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -179,6 +180,10 @@ class ClaudeAgentSdkSession:
         # stale id fails the session start (the caller retires + retries
         # fresh).
         self._resume_session_id = resume_session_id
+        # Display-only partial-text consumer (W4 streaming). Deltas never
+        # enter the projected transcript; the gateway's stream consumer
+        # handles rate limiting and the already_sent final-send dedup.
+        self._on_stream_delta = on_stream_delta
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -324,6 +329,9 @@ class ClaudeAgentSdkSession:
         async for message in self._client.receive_response():
             if self._interrupt_event.is_set():
                 break
+            if type(message).__name__ == "StreamEvent":
+                self._forward_stream_delta(message)
+                continue
             self._notify_tool_started(message)
             projection = projector.project(message)
             if projection.messages:
@@ -352,6 +360,27 @@ class ClaudeAgentSdkSession:
                     # honestly; the partial transcript is still projected.
                     out["error"] = f"SDK turn ended: {subtype}"
         return out
+
+    def _forward_stream_delta(self, message: Any) -> None:
+        """Relay a top-level text delta to the display callback (never the
+        transcript). Subagent streams (parent_tool_use_id set) stay quiet."""
+        if self._on_stream_delta is None:
+            return
+        if getattr(message, "parent_tool_use_id", None):
+            return
+        event = getattr(message, "event", None) or {}
+        if event.get("type") != "content_block_delta":
+            return
+        delta = event.get("delta") or {}
+        if delta.get("type") != "text_delta":
+            return
+        text = delta.get("text")
+        if not text:
+            return
+        try:
+            self._on_stream_delta(text)
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("stream delta callback raised", exc_info=True)
 
     def _notify_tool_started(self, message: Any) -> None:
         """Bridge ToolUseBlocks to Hermes tool-progress (gateway breadcrumbs),
@@ -408,6 +437,12 @@ class ClaudeAgentSdkSession:
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
+        # Default OFF (upstream-conservative): partial messages only when the
+        # operator opts in via env.
+        if os.environ.get("HERMES_CLAUDE_SDK_STREAMING", "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            fields["include_partial_messages"] = True
         return fields
 
     def _build_client(self) -> Any:
