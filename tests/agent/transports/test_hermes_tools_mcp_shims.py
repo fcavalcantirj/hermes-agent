@@ -147,7 +147,7 @@ class TestSessionSearchShim:
 
 class TestShimRegistration:
     def test_both_shims_defined_by_default(self, tmp_hermes_home):
-        names = [name for name, _desc, _fn in _stateless_shim_defs()]
+        names = [name for name, _desc, _schema, _fn in _stateless_shim_defs()]
         assert names == ["memory", "session_search"]
 
     def test_memory_shim_respects_config_disable(self, tmp_hermes_home, monkeypatch):
@@ -156,9 +156,38 @@ class TestShimRegistration:
         monkeypatch.setattr(
             cfg, "load_config", lambda *a, **k: {"memory": {"memory_enabled": False}}
         )
-        names = [name for name, _desc, _fn in _stateless_shim_defs()]
+        names = [name for name, _desc, _schema, _fn in _stateless_shim_defs()]
         assert "memory" not in names
         assert "session_search" in names
+
+    def test_served_schemas_are_the_registry_schemas(self, tmp_hermes_home):
+        # RED-first pin of the FastMCP regression: schemas must be the
+        # authoritative registry JSON, never inferred from a **kwargs
+        # signature (which pydantic renders as a required "kwargs" field,
+        # failing EVERY call at the validation layer).
+        from agent.transports.hermes_tools_mcp_server import _tool_specs
+
+        specs = {name: schema for name, _d, schema, _h in _tool_specs()}
+        assert "memory" in specs and "session_search" in specs
+        for name, schema in specs.items():
+            props = schema.get("properties", {})
+            assert "kwargs" not in props, f"{name} serves an inferred schema"
+        assert "target" in specs["memory"]["properties"]
+        assert "query" in specs["session_search"]["properties"]
+
+    def test_tool_spec_handlers_dispatch(self, tmp_hermes_home):
+        # The spec handler wrapping must actually reach the shim: a memory
+        # add through the spec's handler lands on disk.
+        from agent.transports.hermes_tools_mcp_server import _tool_specs
+
+        handler = {name: h for name, _d, _s, h in _tool_specs()}["memory"]
+        out = json.loads(
+            handler({"action": "add", "target": "memory", "content": "spec path works"})
+        )
+        assert out.get("success") is True
+        assert "spec path works" in (
+            tmp_hermes_home / "memories" / "MEMORY.md"
+        ).read_text()
 
     def test_agent_loop_refusal_stays_intact_for_other_callers(self):
         # The shims must NOT weaken the generic dispatcher: a stateless
