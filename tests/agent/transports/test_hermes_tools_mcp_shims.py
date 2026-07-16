@@ -159,6 +159,16 @@ class TestSessionSearchShim:
         assert out.get("count") == 0
         assert "relaxed_query" not in out
 
+    def test_uninitialized_db_yields_explicit_error(self, tmp_hermes_home, monkeypatch):
+        # Validator C3: a 0-byte state.db (crashed first init) passes the
+        # exists() guard and used to return a SILENT success/count:0.
+        db_path = tmp_hermes_home / "state.db"
+        db_path.touch()  # present but uninitialized
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
+        out = json.loads(dispatch_session_search({"query": "anything"}))
+        assert out.get("success") is False
+        assert "not initialized" in out.get("error", "")
+
     def test_db_opened_read_only(self, tmp_hermes_home, monkeypatch):
         # The shim must never hand a writable DB handle to a model-facing
         # subprocess. SessionDB(read_only=True) attaches with mode=ro.
