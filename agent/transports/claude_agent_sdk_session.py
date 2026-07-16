@@ -106,6 +106,27 @@ def _hermes_repo_root() -> str:
     )
 
 
+# The SDK serializes the stdio MCP config — env INCLUDED — into the claude
+# CLI's --mcp-config argument, i.e. onto the subprocess argv, which any local
+# user can read via ps. Nothing secret may ever ride this dict: the env is a
+# minimal ALLOWLIST, never a copy of the credentialed environment. Keyed
+# Hermes tools inside the server degrade via their own check_fns — the
+# subscription lane's fail-closed posture.
+_MCP_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "PYTHONUTF8",
+    "HERMES_HOME",
+    "HERMES_KANBAN_TASK",
+    "HERMES_QUIET",
+    "HERMES_REDACT_SECRETS",
+)
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -113,16 +134,12 @@ def _build_hermes_tools_mcp_config(
     the exact server the codex runtime uses (backend-agnostic), launched with
     this venv's interpreter. McpStdioServerConfig has no cwd field, so the
     repo root rides PYTHONPATH."""
-    try:
-        from tools.environments.local import hermes_subprocess_env
-
-        env = hermes_subprocess_env(inherit_credentials=True)
-    except Exception:  # pragma: no cover - defensive: never block startup
-        env = dict(os.environ)
-    # Hard rule (this provider's whole point): subscription OAuth only —
-    # never let a metered key leak into any child of this runtime.
-    env.pop("ANTHROPIC_API_KEY", None)
-    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + env.get("PYTHONPATH", "")
+    env = {
+        key: os.environ[key]
+        for key in _MCP_ENV_ALLOWLIST
+        if os.environ.get(key)
+    }
+    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + os.environ.get("PYTHONPATH", "")
     if hermes_session_id:
         # Lets the stateless session_search shim exclude the calling
         # session's own lineage from recall results (#26567).
@@ -202,15 +219,17 @@ class ClaudeAgentSdkSession:
         # Hard rule, enforced fail-closed: this provider exists to bill the
         # Claude SUBSCRIPTION. If a metered ANTHROPIC_API_KEY is present the
         # underlying CLI would silently prefer it — refuse to start instead.
-        if os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get(
-            "HERMES_CLAUDE_SDK_ALLOW_API_KEY"
-        ):
-            raise RuntimeError(
-                "claude-agent-sdk runtime refuses to start: ANTHROPIC_API_KEY "
-                "is set, which would silently switch billing from the Claude "
-                "subscription to metered API usage. Unset it (or set "
-                "HERMES_CLAUDE_SDK_ALLOW_API_KEY=1 to explicitly override)."
-            )
+        for metered_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            if os.environ.get(metered_var) and not os.environ.get(
+                "HERMES_CLAUDE_SDK_ALLOW_API_KEY"
+            ):
+                raise RuntimeError(
+                    f"claude-agent-sdk runtime refuses to start: {metered_var} "
+                    "is set, which would silently switch billing from the "
+                    "Claude subscription to metered API usage. Unset it (or "
+                    "set HERMES_CLAUDE_SDK_ALLOW_API_KEY=1 to explicitly "
+                    "override)."
+                )
         if self._client_factory is None:
             ok, msg = check_claude_sdk_available()
             if not ok:
@@ -218,8 +237,11 @@ class ClaudeAgentSdkSession:
 
         self._start_loop_thread()
         client = self._build_client()
-        self._run_coro(client.connect(), timeout=60.0)
+        # Assign BEFORE connect: a connect timeout/cancel leaves a
+        # half-connected client whose CLI subprocess close() must still reap
+        # — a None _client would skip disconnect and orphan it.
         self._client = client
+        self._run_coro(client.connect(), timeout=60.0)
         logger.info(
             "claude-agent-sdk session started: model=%s mode=%s cwd=%s",
             self._model or "cli-default",
@@ -247,6 +269,11 @@ class ClaudeAgentSdkSession:
         self.close()
 
     # ---------- interrupt ----------
+
+    def consume_interrupt(self) -> None:
+        """Clear a pending interrupt signal — the caller honored it through
+        another path (e.g. the runtime's cold-agent short-circuit)."""
+        self._interrupt_event.clear()
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to interrupt and unwind."""

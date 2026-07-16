@@ -74,6 +74,13 @@ class SystemMessage:
 
 
 @dataclass
+class ServerToolUseBlock:
+    id: str
+    name: str
+    input: dict
+
+
+@dataclass
 class StreamEvent:
     uuid: str = "se-1"
     session_id: str = "sdk-session-1"
@@ -171,6 +178,22 @@ class TestProjector:
         assert out.is_result
         assert out.final_text == "the answer"
         assert out.messages == []
+
+    def test_server_tool_use_never_emits_dangling_tool_calls(self):
+        # Validator C8: server tools (web_search, ...) execute API-side and
+        # never produce a {role:'tool'} echo — emitting a tool_calls entry
+        # for them leaves a dangling tool_call_id that can break replay
+        # through a native provider after a /model switch.
+        p = ClaudeSdkEventProjector()
+        out = p.project(
+            AssistantMessage(content=[
+                ServerToolUseBlock(id="srv-1", name="web_search", input={"query": "x"}),
+                TextBlock("found it"),
+            ])
+        )
+        (msg,) = out.messages
+        assert msg.get("tool_calls") in (None, [],) or "srv-1" not in str(msg.get("tool_calls"))
+        assert msg["content"] == "found it"
 
     def test_lifecycle_messages_ignored(self):
         p = ClaudeSdkEventProjector()
@@ -369,6 +392,7 @@ def _make_agent():
     agent._claude_sdk_session.run_turn.return_value = _make_turn()
     agent.tool_progress_callback = None
     agent._interrupt_requested = False
+    agent._persist_disabled = False
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
     agent.valid_tool_names = set()
@@ -471,6 +495,80 @@ class TestBackgroundReviewSuppressed:
 
 
 # ---------- hermes session id plumbing to the MCP shims (#26567) ----------
+
+
+class TestMcpEnvMinimal:
+    def test_mcp_env_carries_no_secrets(self, monkeypatch):
+        # Validator C4 (HIGH): the SDK inlines the MCP config -- env
+        # included -- into the claude CLI argv, world-readable via ps. The
+        # env must be a minimal allowlist, never the credentialed environ.
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-fake")
+        # (ANTHROPIC_AUTH_TOKEN deliberately NOT set here — the C5 fail-closed
+        # guard would refuse startup before the MCP config is even built,
+        # which is its own test below. The allowlist excludes it regardless.)
+        monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-test-home")
+        session, holder = _make_session(
+            script=[ResultMessage(result="ok")], hermes_session_id="sess-9"
+        )
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        env = holder["client"].options["mcp_servers"]["hermes-tools"]["env"]
+        for secret in ("CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY",
+                       "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            assert secret not in env, f"{secret} leaked into the MCP argv env"
+        assert "PYTHONPATH" in env
+        assert env["HERMES_MCP_SESSION_ID"] == "sess-9"
+        assert env["HERMES_HOME"] == "/tmp/hermes-test-home"
+
+    def test_anthropic_auth_token_refuses_startup(self, monkeypatch):
+        # Validator C5: the CLI also honors ANTHROPIC_AUTH_TOKEN (bearer,
+        # typically metered/proxy) — same fail-closed class as the API key.
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_ALLOW_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "fake-bearer")
+        session = ClaudeAgentSdkSession(cwd="/tmp")  # no factory → real path
+        turn = session.run_turn("hi")
+        assert turn.should_retire
+        assert "ANTHROPIC_AUTH_TOKEN" in (turn.error or "")
+
+    def test_half_connected_client_is_reaped_on_close(self):
+        # Validator C6: on a connect failure the client was assigned only
+        # AFTER connect() returned, so close() skipped disconnect and the
+        # CLI subprocess was orphaned.
+        session, holder = _make_session(connect_exc=RuntimeError("connect blew up"))
+        turn = session.run_turn("hi")
+        assert turn.should_retire
+        session.close()
+        assert holder["client"].disconnected is True
+
+    def test_mid_stream_interrupt_breaks_and_discards_tail(self):
+        # Validator HIGH test-gap: the /stop-arriving-DURING-streaming path
+        # was never exercised at session level.
+        holder = {}
+
+        class MidStreamClient(_FakeClient):
+            async def receive_response(self):
+                yield AssistantMessage(content=[TextBlock("first chunk")])
+                holder["session"]._interrupt_event.set()
+                yield AssistantMessage(content=[TextBlock("tail that must be discarded")])
+                yield ResultMessage(result="tail that must be discarded")
+
+        def factory(options=None):
+            client = MidStreamClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        holder["session"] = session
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.interrupted is True
+        assert all("discarded" not in str(m.get("content")) for m in turn.projected_messages)
 
 
 class TestHermesSessionIdPlumbing:
@@ -906,6 +1004,50 @@ class TestContinuity:
         assert instances[1].inputs[0].startswith("[Continuity digest")
         db.update_claude_sdk_session_id.assert_any_call("sess-1", None)
 
+    def test_cold_short_circuit_consumes_live_session_event_too(self, monkeypatch):
+        # Validator C1: an interrupt racing turn completion sets BOTH the
+        # agent flag and the live session's event. The short-circuit consumed
+        # only the flag — the NEXT legit message then died on the stale
+        # session event with no model call. Honoring must consume both.
+        agent, _db = self._db_agent()
+        live = MagicMock()
+        agent._claude_sdk_session = live
+        agent._interrupt_requested = True
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert result["partial"] is True
+        live.consume_interrupt.assert_called_once()
+        live.run_turn.assert_not_called()
+
+    def test_resume_id_persisted_after_flush_and_gated_on_persist_disabled(self, monkeypatch):
+        # Validator C9: the resume-id UPDATE ran BEFORE the flush that
+        # (re)creates the session row after a transient turn-start lock —
+        # silently discarding continuity. Order must be flush-then-store.
+        agent, db = self._db_agent()
+        order = []
+        agent._flush_messages_to_session_db = MagicMock(
+            side_effect=lambda *a, **k: order.append("flush"))
+        db.update_claude_sdk_session_id.side_effect = (
+            lambda *a, **k: order.append("store"))
+        self._spy_sessions(monkeypatch, [_make_turn(thread_id="sdk-z-1")])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert "store" in order and "flush" in order
+        assert order.index("flush") < order.index("store")
+        # And a fork with persistence disabled must never touch the parent row.
+        agent2, db2 = self._db_agent(persisted_sdk_id="sdk-parent-1")
+        agent2._persist_disabled = True
+        self._spy_sessions(monkeypatch, [_make_turn(thread_id="sdk-fork-9")])
+        run_claude_agent_sdk_turn(
+            agent2, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        db2.update_claude_sdk_session_id.assert_not_called()
+
     def test_interrupted_turn_retires_client_but_persists_resume_id(self, monkeypatch):
         # Adversarial-review HIGH: breaking out of receive_response() on
         # interrupt leaves the interrupted turn's ResultMessage queued in the
@@ -1274,6 +1416,25 @@ class TestSystemPromptAppend:
         out = build_system_prompt_append()
         assert out is not None
         assert "session_search" in out
+
+
+class TestAuxLaneFailClosed:
+    def test_aux_auto_detect_disabled_under_claude_sdk(self, monkeypatch):
+        # Validator C7 (HIGH): with the main provider on the subscription
+        # lane, aux tasks (title-gen, compression) silently fell through to
+        # the metered OpenRouter/Nous auto-detect chain. Auto-detect must
+        # fail closed; explicit aux config remains the operator's opt-in.
+        from agent.auxiliary_client import _resolve_auto
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-fake-key")
+        client, model = _resolve_auto(main_runtime={
+            "provider": "claude-agent-sdk",
+            "model": "claude-opus-4-8",
+            "api_mode": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "claude-subscription-oauth",
+        })
+        assert client is None and model is None
 
 
 class TestSdkAvailabilityGate:
