@@ -539,6 +539,175 @@ class TestHermesSessionIdPlumbing:
         }
 
 
+# ---------- continuity: resume + digest fallback (W3) ----------
+
+
+class TestContinuity:
+    """Retire matrix under test:
+      /new, expiry      → new Hermes session row → no persisted id → FRESH
+      restart/eviction  → same row, id persisted → RESUME
+      error retire      → persisted id CLEARED → next turn fresh + digest
+      stale resume      → retire → clear → ONE fresh retry with digest
+    """
+
+    @staticmethod
+    def _db_agent(persisted_sdk_id=None):
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        db = MagicMock()
+        db.get_session.return_value = {"claude_sdk_session_id": persisted_sdk_id}
+        agent._session_db = db
+        agent._session_db_created = True
+        return agent, db
+
+    @staticmethod
+    def _spy_sessions(monkeypatch, behaviors):
+        """Install a SpySession whose Nth instance behaves per behaviors[N]:
+        a TurnResult-like object to return, or an Exception to raise."""
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        instances = []
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.inputs = []
+                instances.append(self)
+
+            def run_turn(self, user_input):
+                self.inputs.append(user_input)
+                behavior = behaviors[len(instances) - 1]
+                if isinstance(behavior, Exception):
+                    raise behavior
+                return behavior
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        return instances
+
+    def test_creation_resumes_from_persisted_id(self, monkeypatch):
+        agent, _db = self._db_agent(persisted_sdk_id="sdk-old-1")
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert instances[0].kwargs.get("resume_session_id") == "sdk-old-1"
+        # A resumed session already holds the context — no digest.
+        assert instances[0].inputs == ["hi"]
+
+    def test_successful_turn_persists_thread_id(self, monkeypatch):
+        agent, db = self._db_agent()
+        self._spy_sessions(monkeypatch, [_make_turn(thread_id="sdk-new-9")])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        db.update_claude_sdk_session_id.assert_called_with("sess-1", "sdk-new-9")
+
+    def test_error_retire_clears_persisted_id(self, monkeypatch):
+        agent, db = self._db_agent()
+        self._spy_sessions(monkeypatch, [_make_turn(
+            should_retire=True, error="turn timed out", projected_messages=[],
+            final_text="", token_usage_last=None,
+        )])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        db.update_claude_sdk_session_id.assert_called_with("sess-1", None)
+
+    def test_digest_prepended_on_fresh_session_with_history(self, monkeypatch):
+        agent, _db = self._db_agent(persisted_sdk_id=None)
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+        messages = [
+            {"role": "user", "content": "the linter flags shadowed imports"},
+            {"role": "assistant", "content": "Fixed by renaming the local."},
+            {"role": "user", "content": "and the tests?"},
+        ]
+        run_claude_agent_sdk_turn(
+            agent, user_message="and the tests?", original_user_message="and the tests?",
+            messages=messages, effective_task_id="t",
+        )
+        sent = instances[0].inputs[0]
+        assert sent.startswith("[Continuity digest")
+        assert "shadowed imports" in sent
+        assert sent.endswith("and the tests?")
+
+    def test_no_digest_on_brand_new_conversation(self, monkeypatch):
+        agent, _db = self._db_agent(persisted_sdk_id=None)
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hello", original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}], effective_task_id="t",
+        )
+        assert instances[0].inputs == ["hello"]
+
+    def test_stale_resume_retires_then_retries_fresh_with_digest(self, monkeypatch):
+        # The Pi probe: a stale resume id fails the session. The runtime
+        # must clear the id and retry ONCE fresh (digest included) — the
+        # user gets an answer, not an error.
+        agent, db = self._db_agent(persisted_sdk_id="sdk-stale-7")
+        instances = self._spy_sessions(monkeypatch, [
+            _make_turn(should_retire=True, error="resume failed",
+                       projected_messages=[], final_text="", token_usage_last=None),
+            _make_turn(final_text="fresh answer",
+                       projected_messages=[{"role": "assistant", "content": "fresh answer"}]),
+        ])
+        messages = [
+            {"role": "user", "content": "earlier context line"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "current question"},
+        ]
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="current question",
+            original_user_message="current question",
+            messages=messages, effective_task_id="t",
+        )
+        assert result["final_response"] == "fresh answer"
+        assert len(instances) == 2
+        assert instances[0].kwargs.get("resume_session_id") == "sdk-stale-7"
+        assert instances[1].kwargs.get("resume_session_id") is None
+        assert instances[1].inputs[0].startswith("[Continuity digest")
+        db.update_claude_sdk_session_id.assert_any_call("sess-1", None)
+
+    def test_fresh_retire_does_not_retry(self, monkeypatch):
+        # Only a RESUMED session earns the retry — a fresh session that
+        # retires is a real error and must surface, never loop.
+        agent, _db = self._db_agent(persisted_sdk_id=None)
+        instances = self._spy_sessions(monkeypatch, [_make_turn(
+            should_retire=True, error="boom", projected_messages=[],
+            final_text="", token_usage_last=None,
+        )])
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert len(instances) == 1
+        assert result["partial"] is True
+
+class TestSessionResumeField:
+    def test_resume_rides_options_when_set(self):
+        session, holder = _make_session(
+            script=[ResultMessage(result="ok")], resume_session_id="sdk-abc"
+        )
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["resume"] == "sdk-abc"
+
+    def test_no_resume_field_when_unset(self):
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert "resume" not in holder["client"].options
+
+
 # ---------- agent close() releases the SDK session ----------
 
 
