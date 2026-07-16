@@ -455,6 +455,17 @@ def run_claude_agent_sdk_turn(
                     "claude-sdk tool-progress callback raised", exc_info=True
                 )
 
+        def _relay_stream_delta(text: str) -> None:
+            # Late-bound: the gateway assigns stream_delta_callback per turn
+            # AFTER the session exists (and clears it between turns).
+            callback = getattr(agent, "stream_delta_callback", None)
+            if callback is None:
+                return
+            try:
+                callback(text)
+            except Exception:
+                logger.debug("stream delta relay raised", exc_info=True)
+
         append = build_system_prompt_append(
             platform=getattr(agent, "platform", None),
             session_id=getattr(agent, "session_id", None),
@@ -468,6 +479,7 @@ def run_claude_agent_sdk_turn(
             system_prompt_append=append,
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
+            on_stream_delta=_relay_stream_delta,
         )
         # The prologue persisted Hermes' native composed prompt — a prompt
         # this runtime never sends. Overwrite the snapshot with the

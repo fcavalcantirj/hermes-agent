@@ -586,6 +586,91 @@ class TestInterruptRoutesToSdkSession:
         agent.interrupt()  # must not raise
 
 
+# ---------- streaming deltas (W4, env-gated default OFF) ----------
+
+
+class TestStreaming:
+    def test_partial_messages_option_env_gated(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CLAUDE_SDK_STREAMING", "1")
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["include_partial_messages"] is True
+
+    def test_option_absent_by_default(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_STREAMING", raising=False)
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert "include_partial_messages" not in holder["client"].options
+
+    def test_deltas_reach_callback_and_never_the_transcript(self):
+        got = []
+        script = [
+            _text_delta_event("Hel"),
+            _text_delta_event("lo"),
+            AssistantMessage(content=[TextBlock("Hello")]),
+            ResultMessage(result="Hello"),
+        ]
+        session, _ = _make_session(script=script, on_stream_delta=got.append)
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert got == ["Hel", "lo"]
+        # Display-only: deltas never become transcript rows.
+        assert [m["role"] for m in turn.projected_messages] == ["assistant"]
+        assert turn.final_text == "Hello"
+
+    def test_subagent_deltas_are_not_forwarded(self):
+        got = []
+        script = [
+            _text_delta_event("sub", parent_tool_use_id="tool-1"),
+            ResultMessage(result="done"),
+        ]
+        session, _ = _make_session(script=script, on_stream_delta=got.append)
+        try:
+            session.run_turn("hi")
+        finally:
+            session.close()
+        assert got == []
+
+    def test_runtime_wires_late_bound_stream_callback(self, monkeypatch):
+        # The gateway assigns agent.stream_delta_callback per turn AFTER the
+        # session exists — the wiring must read it at call time.
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        relay = captured.get("on_stream_delta")
+        assert callable(relay)
+        seen = []
+        agent.stream_delta_callback = seen.append  # assigned AFTER creation
+        relay("delta-text")
+        assert seen == ["delta-text"]
+        agent.stream_delta_callback = None  # cleared between turns → no crash
+        relay("dropped")
+        assert seen == ["delta-text"]
+
+
 # ---------- continuity: resume + digest fallback (W3) ----------
 
 
