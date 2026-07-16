@@ -73,6 +73,21 @@ class SystemMessage:
 
 
 @dataclass
+class StreamEvent:
+    uuid: str = "se-1"
+    session_id: str = "sdk-session-1"
+    event: dict = field(default_factory=dict)
+    parent_tool_use_id: Optional[str] = None
+
+
+def _text_delta_event(text, parent_tool_use_id=None):
+    return StreamEvent(
+        event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
+        parent_tool_use_id=parent_tool_use_id,
+    )
+
+
+@dataclass
 class ResultMessage:
     subtype: str = "success"
     duration_ms: int = 1
@@ -537,6 +552,38 @@ class TestHermesSessionIdPlumbing:
             "session_id": "sess-1",
             "model": "claude-opus-4-8",
         }
+
+
+# ---------- interrupt routes to the SDK session (W4) ----------
+
+
+class TestInterruptRoutesToSdkSession:
+    """/stop and new-message preemption call AIAgent.interrupt(); the SDK
+    session's request_interrupt (event + client.interrupt()) already works —
+    this pins the one missing caller."""
+
+    @staticmethod
+    def _make_real_agent():
+        from run_agent import AIAgent
+
+        return AIAgent(
+            api_key="test",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    def test_interrupt_reaches_live_sdk_session(self):
+        agent = self._make_real_agent()
+        agent._claude_sdk_session = MagicMock()
+        agent.interrupt()
+        agent._claude_sdk_session.request_interrupt.assert_called_once()
+
+    def test_interrupt_without_sdk_session_stays_safe(self):
+        agent = self._make_real_agent()
+        agent._claude_sdk_session = None
+        agent.interrupt()  # must not raise
 
 
 # ---------- continuity: resume + digest fallback (W3) ----------

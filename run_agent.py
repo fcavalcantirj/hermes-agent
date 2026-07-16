@@ -2747,6 +2747,15 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # claude-agent-sdk runtime: the blocking run_turn observes only the
+        # session's own interrupt event — signal it directly (idempotent;
+        # schedules client.interrupt() on the session's loop). (#25267)
+        sdk_session = getattr(self, "_claude_sdk_session", None)
+        if sdk_session is not None:
+            try:
+                sdk_session.request_interrupt()
+            except Exception:
+                logger.debug("claude-sdk interrupt signal failed", exc_info=True)
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
