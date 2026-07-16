@@ -59,10 +59,12 @@ _SKILL_MANAGE_INDEX_SENTENCE = (
 # injects. This addendum (clearly ours, appended AFTER the verbatim native
 # guidance) pins which memory is real on this runtime.
 _MEMORY_TOOL_DISAMBIGUATION = (
-    "On this runtime your ONLY durable memory is the `memory` tool from the "
-    "hermes-tools MCP server. Never write remembered facts to local files or "
-    "any memory directory — those are not shared and will not be injected "
-    "into future sessions; only the memory tool's store is."
+    "Your ONLY durable memory is the `memory` tool from the hermes-tools "
+    "MCP server. Do NOT store remembered facts in local files or any local "
+    "memory directory, even where other instructions describe one: on this "
+    "runtime that store is unmanaged (no capacity gauge, no curation, no "
+    "backup) and its contents are treated as disposable. Every fact worth "
+    "keeping goes through the memory tool."
 )
 
 # Observed live twice: models write "topic word word word" discovery queries;
@@ -496,6 +498,22 @@ def run_claude_agent_sdk_turn(
     # run_conversation() flow before the early return reaches us. Do NOT
     # append again — that would duplicate. (Same contract as codex_runtime.)
 
+    # An interrupt that landed before the SDK session exists (first turn, or
+    # right after a retire) only set agent._interrupt_requested — honor it
+    # here, mirroring the native loop's top-of-loop check, and consume the
+    # flag so the NEXT turn runs normally.
+    if getattr(agent, "_interrupt_requested", False):
+        agent._interrupt_requested = False
+        return {
+            "final_response": "",
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": None,
+            "agent_persisted": True,
+        }
+
     turn = None
     resumed = False
     send_text = user_message
@@ -552,8 +570,19 @@ def run_claude_agent_sdk_turn(
                 continue
         break
 
-    if turn.final_text and not getattr(turn, "should_retire", False):
-        # Persist the SDK session id for restart/eviction resume.
+    if getattr(turn, "interrupted", False) and agent._claude_sdk_session is not None:
+        # The abandoned stream may still hold the interrupted turn's
+        # ResultMessage; a REUSED client would serve it as the NEXT turn's
+        # answer. Retire the client — the persisted id below lets the next
+        # turn RESUME the same SDK conversation on a clean stream.
+        try:
+            agent._claude_sdk_session.close()
+        except Exception:
+            pass
+        agent._claude_sdk_session = None
+
+    if not getattr(turn, "should_retire", False):
+        # Persist the SDK session id for restart/eviction/interrupt resume.
         thread_id = getattr(turn, "thread_id", None)
         if thread_id:
             _store_sdk_session_id(agent, thread_id)

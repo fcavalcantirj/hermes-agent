@@ -278,7 +278,13 @@ class ClaudeAgentSdkSession:
             result.should_retire = True
             return result
 
-        self._interrupt_event.clear()
+        # An interrupt that arrived between turns or during connect (up to
+        # 60s) targets THIS turn — honor it instead of erasing it. (The old
+        # unconditional clear() silently swallowed that window.)
+        if self._interrupt_event.is_set():
+            self._interrupt_event.clear()
+            result.interrupted = True
+            return result
         text = _coerce_turn_input_text(user_input)
 
         try:
@@ -305,6 +311,10 @@ class ClaudeAgentSdkSession:
         result.thread_id = self._session_id
         result.turn_id = turn_data.get("result_uuid")
         result.interrupted = self._interrupt_event.is_set()
+        if result.interrupted:
+            # Consume the honored interrupt so it cannot bleed into the
+            # next turn on this session object.
+            self._interrupt_event.clear()
         if turn_data["error"]:
             hint = classify_auth_failure(turn_data["error"])
             result.error = hint or turn_data["error"]
