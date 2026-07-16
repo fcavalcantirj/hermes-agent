@@ -3569,6 +3569,17 @@ class AIAgent:
         except Exception:
             pass
 
+        # 5b. Disconnect the claude-agent-sdk session (subscription runtime).
+        # The SDK client owns a Claude Code CLI subprocess; dropping it to GC
+        # on /new, expiry, or cache eviction leaks that subprocess. (#25267)
+        try:
+            sdk_session = getattr(self, "_claude_sdk_session", None)
+            if sdk_session is not None:
+                self._claude_sdk_session = None
+                sdk_session.close()
+        except Exception:
+            pass
+
         # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
