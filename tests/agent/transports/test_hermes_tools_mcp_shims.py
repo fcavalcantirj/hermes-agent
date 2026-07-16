@@ -41,13 +41,13 @@ class TestMemoryShim:
     def test_write_lands_in_canonical_memories_dir(self, tmp_hermes_home):
         out = json.loads(
             dispatch_memory(
-                {"action": "add", "target": "memory", "content": "solar panels arrive thursday"}
+                {"action": "add", "target": "memory", "content": "auth refactor merged to main"}
             )
         )
         assert out.get("success") is True
         memory_file = tmp_hermes_home / "memories" / "MEMORY.md"
         assert memory_file.exists()
-        assert "solar panels arrive thursday" in memory_file.read_text()
+        assert "auth refactor merged to main" in memory_file.read_text()
 
     def test_native_caps_enforced(self, tmp_hermes_home):
         # The shim reuses the native store: an oversized add must be rejected
@@ -81,16 +81,16 @@ class TestSessionSearchShim:
 
         db = SessionDB(db_path=path)
         db.create_session("sess-hist-1", source="telegram")
-        db.append_message("sess-hist-1", "user", "when do the solar panels arrive?")
-        db.append_message("sess-hist-1", "assistant", "The solar panels arrive on Thursday.")
+        db.append_message("sess-hist-1", "user", "when did we merge the auth refactor?")
+        db.append_message("sess-hist-1", "assistant", "The auth refactor merged on Thursday.")
         db.close()
 
     def test_search_returns_seeded_rows(self, tmp_hermes_home, monkeypatch):
         db_path = tmp_hermes_home / "state.db"
         self._seed_db(db_path)
         monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
-        out = dispatch_session_search({"query": "solar panels"})
-        assert "solar panels" in out
+        out = dispatch_session_search({"query": "auth refactor"})
+        assert "auth refactor" in out
         assert "sess-hist-1" in out
 
     def test_missing_db_yields_explicit_error(self, tmp_hermes_home, monkeypatch):
@@ -119,7 +119,7 @@ class TestSessionSearchShim:
             return real(**kwargs)
 
         monkeypatch.setattr(sst, "session_search", spy)
-        dispatch_session_search({"query": "solar"})
+        dispatch_session_search({"query": "auth"})
         assert captured.get("current_session_id") == "sess-current-9"
 
     def test_db_opened_read_only(self, tmp_hermes_home, monkeypatch):
@@ -141,7 +141,7 @@ class TestSessionSearchShim:
                 super().__init__(*args, **kwargs)
 
         monkeypatch.setattr(hermes_state, "SessionDB", SpyDB)
-        dispatch_session_search({"query": "solar"})
+        dispatch_session_search({"query": "auth"})
         assert captured.get("read_only") is True
 
 
