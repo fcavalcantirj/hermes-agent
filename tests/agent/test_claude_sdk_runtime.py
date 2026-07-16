@@ -501,6 +501,43 @@ class TestHermesSessionIdPlumbing:
         )
         assert captured.get("hermes_session_id") == "sess-1"
 
+    def test_runtime_passes_context_to_append_builder(self, monkeypatch):
+        # W2: the append builder receives the agent's platform/session/model
+        # so the session line and platform hint reflect the live session.
+        import agent.claude_sdk_runtime as rt
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        captured = {}
+
+        def fake_append(**kwargs):
+            captured.update(kwargs)
+            return "APPEND-UNDER-TEST"
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(rt, "build_system_prompt_append", fake_append)
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent.platform = "telegram"
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        assert captured == {
+            "platform": "telegram",
+            "session_id": "sess-1",
+            "model": "claude-opus-4-8",
+        }
+
 
 # ---------- agent close() releases the SDK session ----------
 
@@ -571,43 +608,189 @@ class TestProviderWiring:
 
 
 class TestSystemPromptAppend:
-    # Deliberate pin update (W1, #26567): memory files are read from the
-    # canonical memories/ dir — the same store the memory tool writes —
-    # instead of the HERMES_HOME root (the old behavior was a path bug:
-    # tool writes landed where the append never looked).
+    # W2 (composer parity): the append is composed from Hermes' NATIVE
+    # builders — memory gauge via MemoryStore.format_for_system_prompt,
+    # guidance constants from agent.prompt_builder, the skills index via
+    # build_skills_system_prompt — never re-implemented formats. Guidance
+    # appears ONLY for tools that are actually callable through the MCP
+    # shims. Deliberate pin updates from W1 are annotated inline.
 
-    def test_soul_and_memory_composition(self, tmp_path, monkeypatch):
-        from agent.claude_sdk_runtime import build_system_prompt_append
-
-        soul = tmp_path / "SOUL.md"
-        soul.write_text("# I am the persona under test")
+    @staticmethod
+    def _home(tmp_path, monkeypatch, *, soul=None, memory=None, user=None):
         hermes_home = tmp_path / "hermes"
         memories = hermes_home / "memories"
         memories.mkdir(parents=True)
-        (memories / "USER.md").write_text("The user prefers concise results")
-        (memories / "MEMORY.md").write_text("x" * 20000)  # over cap
-        monkeypatch.setenv("HERMES_CLAUDE_SDK_APPEND_FILE", str(soul))
+        if memory is not None:
+            (memories / "MEMORY.md").write_text(memory)
+        if user is not None:
+            (memories / "USER.md").write_text(user)
+        if soul is not None:
+            soul_file = tmp_path / "SOUL.md"
+            soul_file.write_text(soul)
+            monkeypatch.setenv("HERMES_CLAUDE_SDK_APPEND_FILE", str(soul_file))
+        else:
+            monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        return hermes_home
 
+    def test_soul_first_and_user_content_present(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(
+            tmp_path, monkeypatch,
+            soul="# I am the persona under test",
+            user="The user prefers concise results",
+        )
         out = build_system_prompt_append()
         assert out is not None
         assert out.startswith("# I am the persona under test")
         assert "The user prefers concise results" in out
-        # Capped sources cannot blow the context budget.
-        assert len(out) < 20000
+
+    def test_gauge_blocks_are_the_native_render(self, tmp_path, monkeypatch):
+        # Byte-pin: the memory/user blocks are EXACTLY what the native
+        # composer injects (MemoryStore.format_for_system_prompt output,
+        # gauge header included) — never a re-implementation.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        from tools.memory_tool import load_on_disk_store
+
+        self._home(
+            tmp_path, monkeypatch,
+            memory="ci runs on the drone server",
+            user="prefers squash merges",
+        )
+        store = load_on_disk_store()
+        expected_memory = store.format_for_system_prompt("memory")
+        expected_user = store.format_for_system_prompt("user")
+        assert "MEMORY (your personal notes) [" in expected_memory  # sanity
+        assert "USER PROFILE (who the user is) [" in expected_user
+
+        out = build_system_prompt_append()
+        assert expected_memory in out
+        assert expected_user in out
+
+    def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
+        # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
+        # the skill tool (skill_manage is not exposed — checklist #3:
+        # guidance only for callable tools). The strip must be a pure
+        # deletion of a sentence that actually exists in the native constant
+        # — if upstream rewords it, this test goes red and we re-derive.
+        from agent.claude_sdk_runtime import (
+            _strip_uncallable_tool_guidance,
+            build_system_prompt_append,
+        )
+        from agent.prompt_builder import MEMORY_GUIDANCE
+
+        self._home(tmp_path, monkeypatch, memory="uses trunk-based development")
+        stripped = _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
+        assert stripped != MEMORY_GUIDANCE, "skill sentence not found — upstream reworded it"
+        assert "save it as a skill with the skill tool" not in stripped
+
+        out = build_system_prompt_append()
+        assert "You have persistent memory across sessions" in out
+        assert stripped in out
+        assert "save it as a skill with the skill tool" not in out
+
+    def test_skills_guidance_never_injected(self, tmp_path, monkeypatch):
+        # SKILLS_GUIDANCE instructs skill_manage — unexposed by design.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch, memory="a fact")
+        out = build_system_prompt_append()
+        assert "skill_manage" not in out
+
+    def test_session_search_guidance_always_present(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+
+        self._home(tmp_path, monkeypatch)  # no memory files at all
+        out = build_system_prompt_append()
+        assert out is not None
+        assert SESSION_SEARCH_GUIDANCE in out
+
+    def test_memory_disabled_removes_blocks_and_guidance(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import hermes_cli.config as cfg
+
+        self._home(tmp_path, monkeypatch, memory="should not appear")
+        monkeypatch.setattr(
+            cfg, "load_config", lambda *a, **k: {"memory": {"memory_enabled": False}}
+        )
+        out = build_system_prompt_append()
+        assert "should not appear" not in (out or "")
+        assert "You have persistent memory" not in (out or "")
+        # session_search still works when memory is off — its guidance stays.
+        assert "session_search" in (out or "")
+
+    def test_session_line_and_platform_hint(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        from agent.prompt_builder import PLATFORM_HINTS
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append(
+            platform="telegram", session_id="sess-77", model="claude-opus-4-8"
+        )
+        assert "Conversation started:" in out  # date-only, native format
+        assert "Session ID: sess-77" in out
+        assert "Model: claude-opus-4-8" in out
+        assert "Provider: claude-agent-sdk" in out
+        assert PLATFORM_HINTS["telegram"].strip() in out
+
+    def test_unknown_platform_no_hint_and_none_safe(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append(platform="faxmachine")
+        assert out is not None  # None-safe, no crash, no bogus hint
+
+    def test_budget_skips_oversized_block_keeps_later_blocks(self, tmp_path, monkeypatch):
+        # Whole-block budget policy: a block that does not fit is SKIPPED
+        # entirely (never truncated mid-block) and later, smaller blocks
+        # still make it in. An oversized hand-edited MEMORY.md must not
+        # evict the guidance. (Deliberate pin update from W1's 8000-char
+        # raw-file cap: the store renders whole blocks; the budget governs.)
+        from agent.claude_sdk_runtime import (
+            _APPEND_TOTAL_MAX_CHARS,
+            build_system_prompt_append,
+        )
+
+        self._home(tmp_path, monkeypatch, memory="y" * (_APPEND_TOTAL_MAX_CHARS + 5000))
+        out = build_system_prompt_append()
+        assert "yyyyyyyyyy" not in out  # oversized memory block skipped whole
+        assert "session_search" in out  # later block survived
+        assert len(out) <= _APPEND_TOTAL_MAX_CHARS
+
+    def test_skills_index_wiring(self, tmp_path, monkeypatch):
+        # The index rides the NATIVE builder; we pin OUR wiring — called
+        # with the honest MCP-exposed tool set (shims included).
+        import agent.prompt_builder as pb
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+
+        self._home(tmp_path, monkeypatch)
+        captured = {}
+
+        def fake_index(**kwargs):
+            captured.update(kwargs)
+            return "## Skills index\n- fixture-skill: proves the wiring"
+
+        monkeypatch.setattr(pb, "build_skills_system_prompt", fake_index)
+        out = build_system_prompt_append()
+        assert "fixture-skill: proves the wiring" in out
+        tools = captured.get("available_tools") or set()
+        assert "memory" in tools and "session_search" in tools
+        assert set(EXPOSED_TOOLS) <= tools
 
     def test_root_files_are_not_read(self, tmp_path, monkeypatch):
-        # Negative control: ONE canonical location. Files left at the
-        # HERMES_HOME root (the pre-migration layout) must NOT be injected —
-        # a silent fallback would resurrect the two-locations divergence.
+        # Negative control (W1): ONE canonical location. Files left at the
+        # HERMES_HOME root must NOT be injected.
         from agent.claude_sdk_runtime import build_system_prompt_append
 
         hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
+        (hermes_home / "memories").mkdir(parents=True)
         (hermes_home / "USER.md").write_text("stale root copy")
         monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        assert build_system_prompt_append() is None
+        assert "stale root copy" not in (build_system_prompt_append() or "")
 
     def test_memory_shim_write_is_visible_to_next_append(self, tmp_path, monkeypatch):
         # The loop closes: a fact saved through the stateless MCP shim must
@@ -615,11 +798,7 @@ class TestSystemPromptAppend:
         from agent.claude_sdk_runtime import build_system_prompt_append
         from agent.transports.hermes_tools_mcp_server import dispatch_memory
 
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
+        self._home(tmp_path, monkeypatch)
         dispatch_memory(
             {"action": "add", "target": "memory", "content": "the beta build ships friday"}
         )
@@ -627,12 +806,17 @@ class TestSystemPromptAppend:
         assert out is not None
         assert "the beta build ships friday" in out
 
-    def test_no_sources_returns_none(self, tmp_path, monkeypatch):
+    def test_empty_home_still_provides_guidance(self, tmp_path, monkeypatch):
+        # Deliberate pin update (was: no sources → None). Since W2 the
+        # append always carries the recall/memory behavior contract — a
+        # brand-new box still gets guidance, so the brain knows its tools.
         from agent.claude_sdk_runtime import build_system_prompt_append
 
         monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # empty dir
-        assert build_system_prompt_append() is None
+        out = build_system_prompt_append()
+        assert out is not None
+        assert "session_search" in out
 
 
 class TestSdkAvailabilityGate:
