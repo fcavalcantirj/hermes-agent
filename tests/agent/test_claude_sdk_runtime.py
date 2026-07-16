@@ -571,15 +571,21 @@ class TestProviderWiring:
 
 
 class TestSystemPromptAppend:
+    # Deliberate pin update (W1, #26567): memory files are read from the
+    # canonical memories/ dir — the same store the memory tool writes —
+    # instead of the HERMES_HOME root (the old behavior was a path bug:
+    # tool writes landed where the append never looked).
+
     def test_soul_and_memory_composition(self, tmp_path, monkeypatch):
         from agent.claude_sdk_runtime import build_system_prompt_append
 
         soul = tmp_path / "SOUL.md"
         soul.write_text("# I am the persona under test")
         hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "USER.md").write_text("The user prefers concise results")
-        (hermes_home / "MEMORY.md").write_text("x" * 20000)  # over cap
+        memories = hermes_home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text("The user prefers concise results")
+        (memories / "MEMORY.md").write_text("x" * 20000)  # over cap
         monkeypatch.setenv("HERMES_CLAUDE_SDK_APPEND_FILE", str(soul))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
@@ -589,6 +595,37 @@ class TestSystemPromptAppend:
         assert "The user prefers concise results" in out
         # Capped sources cannot blow the context budget.
         assert len(out) < 20000
+
+    def test_root_files_are_not_read(self, tmp_path, monkeypatch):
+        # Negative control: ONE canonical location. Files left at the
+        # HERMES_HOME root (the pre-migration layout) must NOT be injected —
+        # a silent fallback would resurrect the two-locations divergence.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "USER.md").write_text("stale root copy")
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        assert build_system_prompt_append() is None
+
+    def test_memory_shim_write_is_visible_to_next_append(self, tmp_path, monkeypatch):
+        # The loop closes: a fact saved through the stateless MCP shim must
+        # appear in the next session's system-prompt append.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        from agent.transports.hermes_tools_mcp_server import dispatch_memory
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_APPEND_FILE", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        dispatch_memory(
+            {"action": "add", "target": "memory", "content": "the beta build ships friday"}
+        )
+        out = build_system_prompt_append()
+        assert out is not None
+        assert "the beta build ships friday" in out
 
     def test_no_sources_returns_none(self, tmp_path, monkeypatch):
         from agent.claude_sdk_runtime import build_system_prompt_append

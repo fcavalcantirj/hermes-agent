@@ -58,9 +58,19 @@ def build_system_prompt_append() -> Optional[str]:
                 "HERMES_CLAUDE_SDK_APPEND_FILE=%s is set but unreadable/empty",
                 soul_path,
             )
-    hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    # ONE canonical location: the memory tool's own memories/ dir (the same
+    # store the stateless MCP shim writes through — #26567). Reading the
+    # HERMES_HOME root here was a path bug: tool writes landed where this
+    # append never looked.
+    try:
+        from tools.memory_tool import get_memory_dir
+
+        memories_dir = str(get_memory_dir())
+    except Exception:  # pragma: no cover - defensive fallback, same layout
+        hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        memories_dir = os.path.join(hermes_home, "memories")
     for filename, label in (("USER.md", "About the user"), ("MEMORY.md", "Working memory")):
-        content = _read_capped(os.path.join(hermes_home, filename))
+        content = _read_capped(os.path.join(memories_dir, filename))
         if content:
             parts.append(f"## {label} (Hermes memory — curated across sessions)\n{content}")
     return "\n\n".join(parts) or None
