@@ -237,6 +237,7 @@ def run_claude_agent_sdk_turn(
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,
             system_prompt_append=build_system_prompt_append(),
+            hermes_session_id=getattr(agent, "session_id", None),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the standard

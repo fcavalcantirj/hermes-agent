@@ -106,7 +106,9 @@ def _hermes_repo_root() -> str:
     )
 
 
-def _build_hermes_tools_mcp_config() -> dict[str, Any]:
+def _build_hermes_tools_mcp_config(
+    hermes_session_id: Optional[str] = None,
+) -> dict[str, Any]:
     """The stdio MCP server exposing Hermes tools into the SDK agent loop —
     the exact server the codex runtime uses (backend-agnostic), launched with
     this venv's interpreter. McpStdioServerConfig has no cwd field, so the
@@ -121,6 +123,10 @@ def _build_hermes_tools_mcp_config() -> dict[str, Any]:
     # never let a metered key leak into any child of this runtime.
     env.pop("ANTHROPIC_API_KEY", None)
     env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + env.get("PYTHONPATH", "")
+    if hermes_session_id:
+        # Lets the stateless session_search shim exclude the calling
+        # session's own lineage from recall results (#26567).
+        env["HERMES_MCP_SESSION_ID"] = str(hermes_session_id)
     return {
         "type": "stdio",
         "command": sys.executable,
@@ -147,6 +153,7 @@ class ClaudeAgentSdkSession:
         max_budget_usd: Optional[float] = None,
         client_factory: Optional[Callable[..., Any]] = None,
         include_hermes_tools: bool = True,
+        hermes_session_id: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -163,6 +170,9 @@ class ClaudeAgentSdkSession:
         self._max_budget_usd = max_budget_usd
         self._client_factory = client_factory  # test seam
         self._include_hermes_tools = include_hermes_tools
+        # Hermes-side session id, exported to the hermes-tools MCP subprocess
+        # so the stateless session_search shim can exclude its own lineage.
+        self._hermes_session_id = hermes_session_id
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -362,7 +372,9 @@ class ClaudeAgentSdkSession:
         on it without importing the SDK."""
         mcp_servers: dict[str, Any] = {}
         if self._include_hermes_tools:
-            mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config()
+            mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
+                hermes_session_id=self._hermes_session_id
+            )
 
         system_prompt: Any = {"type": "preset", "preset": "claude_code"}
         if self._system_prompt_append:
