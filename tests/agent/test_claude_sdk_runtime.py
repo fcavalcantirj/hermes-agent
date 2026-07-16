@@ -453,6 +453,43 @@ class TestBackgroundReviewSuppressed:
         assert agent._iters_since_skill == 0
 
 
+# ---------- agent close() releases the SDK session ----------
+
+
+class TestAgentCloseClosesSdkSession:
+    """AIAgent.close() runs on /new, session expiry, and agent-cache
+    eviction. Without an explicit disconnect the SDK client (and its CLI
+    subprocess) is dropped to GC — a leak. (#25267)"""
+
+    @staticmethod
+    def _make_real_agent():
+        from run_agent import AIAgent
+
+        return AIAgent(
+            api_key="test",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    def test_close_disconnects_claude_sdk_session(self):
+        agent = self._make_real_agent()
+        sdk_session = MagicMock()
+        agent._claude_sdk_session = sdk_session
+        agent.close()
+        sdk_session.close.assert_called_once()
+        assert agent._claude_sdk_session is None
+
+    def test_close_without_sdk_session_stays_safe(self):
+        # Negative control: an agent that never created an SDK session (or
+        # already closed it) must close without raising — idempotency.
+        agent = self._make_real_agent()
+        agent.close()
+        agent._claude_sdk_session = None
+        agent.close()
+
+
 # ---------- provider wiring ----------
 
 
