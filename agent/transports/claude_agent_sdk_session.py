@@ -154,6 +154,7 @@ class ClaudeAgentSdkSession:
         client_factory: Optional[Callable[..., Any]] = None,
         include_hermes_tools: bool = True,
         hermes_session_id: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -173,6 +174,11 @@ class ClaudeAgentSdkSession:
         # Hermes-side session id, exported to the hermes-tools MCP subprocess
         # so the stateless session_search shim can exclude its own lineage.
         self._hermes_session_id = hermes_session_id
+        # SDK-side session id to resume (#25267 continuity). Verified live:
+        # resume restores the model context and keeps the SAME session id; a
+        # stale id fails the session start (the caller retires + retries
+        # fresh).
+        self._resume_session_id = resume_session_id
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -391,7 +397,7 @@ class ClaudeAgentSdkSession:
         ):
             can_use_tool = self._make_can_use_tool()
 
-        return {
+        fields = {
             "model": self._model,
             "cwd": self._cwd,
             "permission_mode": self._permission_mode,
@@ -400,6 +406,9 @@ class ClaudeAgentSdkSession:
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
         }
+        if self._resume_session_id:
+            fields["resume"] = self._resume_session_id
+        return fields
 
     def _build_client(self) -> Any:
         fields = self.build_option_fields()
