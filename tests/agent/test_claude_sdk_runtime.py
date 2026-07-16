@@ -414,6 +414,45 @@ class TestRuntimeGlue:
         assert result["partial"] is True
 
 
+# ---------- background review must not spawn on this runtime ----------
+
+
+class TestBackgroundReviewSuppressed:
+    """The review fork inherits ``api_mode="claude_agent_sdk"`` and lands in
+    a fresh SDK session whose tool surface has no ``memory``/``skill_manage``
+    — it burns a subscription turn and cannot write anything. The runtime
+    must therefore never spawn it, while the nudge counters keep ticking so
+    a bounded replacement pass can reuse them. (#25267)"""
+
+    def test_memory_nudge_does_not_spawn_review(self):
+        agent = _make_agent()
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+            should_review_memory=True,
+        )
+        agent._spawn_background_review.assert_not_called()
+
+    def test_skill_nudge_does_not_spawn_review_but_counter_still_ticks(self):
+        agent = _make_agent()
+        agent._skill_nudge_interval = 1
+        agent.valid_tool_names = {"skill_manage"}
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        agent._spawn_background_review.assert_not_called()
+        # Counter machinery stays intact: the interval crossing still resets
+        # it, exactly as before — only the spawn is suppressed.
+        assert agent._iters_since_skill == 0
+
+
 # ---------- provider wiring ----------
 
 
