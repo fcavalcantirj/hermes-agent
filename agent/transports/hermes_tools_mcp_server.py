@@ -172,9 +172,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 #                    config overrides, external-drift guard, threat scan,
 #                    file locking and the consolidation-failure breaker all
 #                    live in MemoryStore/memory_tool and are inherited.
-#                    NOTE: shim writes do not mirror to an external
-#                    MemoryProvider — that hook lives in the native tool
-#                    executor. Acceptable for provider-less deployments.
+#                    NOTE: a shim write cannot mirror through MemoryProvider
+#                    hooks (no MemoryManager in this subprocess), so when
+#                    `memory.provider` configures an external backend the
+#                    shim FAILS CLOSED — unregistered, and refused at
+#                    dispatch — rather than silently diverging the stores.
 #   session_search → `SessionDB(read_only=True)` over the state DB (never a
 #                    writable handle in a model-facing subprocess). The
 #                    calling session's id arrives via HERMES_MCP_SESSION_ID
@@ -186,10 +188,40 @@ _SESSION_ID_ENV = "HERMES_MCP_SESSION_ID"
 _STATE_DB_ENV = "HERMES_MCP_STATE_DB"
 
 
+def _external_memory_provider():
+    """Name of the external memory provider configured via `memory.provider`,
+    or None for the builtin on-disk store. Config-read failure counts as
+    builtin — the same fail-open posture as `_memory_enabled_in_config()`."""
+    try:
+        from hermes_cli.config import load_config
+
+        provider = str(
+            (((load_config() or {}).get("memory", {}) or {}).get("provider") or "")
+        ).strip().lower()
+    except Exception:
+        return None
+    if provider in ("", "none", "builtin", "off", "disabled"):
+        return None
+    return provider
+
+
 def dispatch_memory(kwargs: dict) -> str:
     """Stateless `memory` dispatch: native handler + on-disk store."""
     from tools.memory_tool import load_on_disk_store, memory_tool
+    from tools.registry import tool_error
 
+    provider = _external_memory_provider()
+    if provider is not None:
+        # Every memory action mutates (add/replace/remove/batch), and a
+        # mutation here can never reach the external backend — refuse with
+        # the reason instead of letting the two stores drift apart.
+        return tool_error(
+            f"memory is disabled in this MCP shim: external memory provider "
+            f"'{provider}' is configured (memory.provider) and shim writes "
+            f"cannot mirror to it. Use the memory tool in the main agent "
+            f"loop instead.",
+            success=False,
+        )
     return memory_tool(
         action=kwargs.get("action", ""),
         target=kwargs.get("target", "memory"),
@@ -312,10 +344,12 @@ def _stateless_shim_defs() -> list:
 
     session_search is always defined — a missing state DB degrades to an
     explicit error at call time, which is more diagnosable than an absent
-    tool. memory respects the config kill-switch.
+    tool. memory respects the config kill-switch AND stays unregistered when
+    an external memory provider is configured (shim writes cannot mirror
+    through MemoryProvider hooks — see the scope note above; #26604).
     """
     defs = []
-    if _memory_enabled_in_config():
+    if _memory_enabled_in_config() and _external_memory_provider() is None:
         from tools.memory_tool import MEMORY_SCHEMA
 
         defs.append((

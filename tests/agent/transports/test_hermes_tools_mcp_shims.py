@@ -74,6 +74,62 @@ class TestMemoryShim:
         content = (tmp_hermes_home / "memories" / "MEMORY.md").read_text()
         assert "fact alpha" in content and "fact beta" in content
 
+    def test_fails_closed_when_external_provider_configured(
+        self, tmp_hermes_home, monkeypatch
+    ):
+        # #26604 precondition: a shim write cannot mirror through
+        # MemoryProvider hooks (no MemoryManager in this subprocess), so a
+        # configured external backend must refuse the dispatch — silent
+        # store divergence is the failure this prevents.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg, "load_config", lambda *a, **k: {"memory": {"provider": "honcho"}}
+        )
+        out = json.loads(
+            dispatch_memory({"action": "add", "target": "memory", "content": "x"})
+        )
+        assert out.get("success") is False
+        assert "honcho" in out.get("error", "")
+        assert not (tmp_hermes_home / "memories" / "MEMORY.md").exists()
+
+        batch = json.loads(
+            dispatch_memory(
+                {"target": "memory", "operations": [{"action": "add", "content": "y"}]}
+            )
+        )
+        assert batch.get("success") is False
+
+    def test_builtin_provider_value_is_not_external(self, tmp_hermes_home, monkeypatch):
+        # Control (non-vacuous): 'builtin' means the on-disk store — the
+        # guard must not fire, and the write must land.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg, "load_config", lambda *a, **k: {"memory": {"provider": "builtin"}}
+        )
+        out = json.loads(
+            dispatch_memory({"action": "add", "target": "memory", "content": "kept"})
+        )
+        assert out.get("success") is True
+        assert "kept" in (tmp_hermes_home / "memories" / "MEMORY.md").read_text()
+
+    def test_shim_unregistered_when_external_provider_configured(
+        self, tmp_hermes_home, monkeypatch
+    ):
+        # Registration-level twin of the dispatch guard: the tool should not
+        # even be offered to the model when it can only refuse.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config",
+            lambda *a, **k: {"memory": {"memory_enabled": True, "provider": "mem0"}},
+        )
+        names = [name for name, _desc, _schema, _fn in _stateless_shim_defs()]
+        assert "memory" not in names
+        assert "session_search" in names
+
 
 class TestSessionSearchShim:
     def _seed_db(self, path):
