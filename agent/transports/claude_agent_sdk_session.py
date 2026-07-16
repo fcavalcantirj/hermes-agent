@@ -122,6 +122,7 @@ _MCP_ENV_ALLOWLIST = (
     "PYTHONUTF8",
     "HERMES_HOME",
     "HERMES_KANBAN_TASK",
+    "HERMES_MCP_STATE_DB",  # the shims' documented state-DB override — a path, not a secret
     "HERMES_QUIET",
     "HERMES_REDACT_SECRETS",
 )

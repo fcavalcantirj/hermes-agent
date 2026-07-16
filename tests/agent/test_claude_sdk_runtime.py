@@ -523,6 +523,20 @@ class TestMcpEnvMinimal:
         assert env["HERMES_MCP_SESSION_ID"] == "sess-9"
         assert env["HERMES_HOME"] == "/tmp/hermes-test-home"
 
+    def test_state_db_override_rides_the_mcp_env(self, monkeypatch):
+        # Validator N1 (round 3): the C4 allowlist dropped HERMES_MCP_STATE_DB,
+        # silently killing the shims' documented state-DB override — the MCP
+        # subprocess searched the DEFAULT DB with no error. A path, not a
+        # secret, so it belongs on the allowlist.
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", "/tmp/custom-state.db")
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        env = holder["client"].options["mcp_servers"]["hermes-tools"]["env"]
+        assert env["HERMES_MCP_STATE_DB"] == "/tmp/custom-state.db"
+
     def test_anthropic_auth_token_refuses_startup(self, monkeypatch):
         # Validator C5: the CLI also honors ANTHROPIC_AUTH_TOKEN (bearer,
         # typically metered/proxy) — same fail-closed class as the API key.
