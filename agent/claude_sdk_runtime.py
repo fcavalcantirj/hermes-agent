@@ -357,6 +357,8 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
 
 def _persisted_sdk_session_id(agent) -> Optional[str]:
     """The SDK session id stored on the Hermes session row (or None)."""
+    if getattr(agent, "_persist_disabled", False):
+        return None
     if not (getattr(agent, "_session_db", None) and getattr(agent, "session_id", None)):
         return None
     try:
@@ -369,6 +371,10 @@ def _persisted_sdk_session_id(agent) -> Optional[str]:
 
 def _store_sdk_session_id(agent, value: Optional[str]) -> None:
     """Persist (or clear, with None) the SDK session id on the session row."""
+    if getattr(agent, "_persist_disabled", False):
+        # A review/curator fork shares the parent's session_id — it must
+        # never write its own resume id onto the parent's row.
+        return
     if not (getattr(agent, "_session_db", None) and getattr(agent, "session_id", None)):
         return
     try:
@@ -504,6 +510,15 @@ def run_claude_agent_sdk_turn(
     # flag so the NEXT turn runs normally.
     if getattr(agent, "_interrupt_requested", False):
         agent._interrupt_requested = False
+        live_session = getattr(agent, "_claude_sdk_session", None)
+        if live_session is not None:
+            # interrupt() also set the live session's event; consume it here
+            # or the NEXT legitimate message dies on the stale event with no
+            # model call.
+            try:
+                live_session.consume_interrupt()
+            except Exception:
+                logger.debug("consume_interrupt failed", exc_info=True)
         return {
             "final_response": "",
             "messages": messages,
@@ -585,12 +600,6 @@ def run_claude_agent_sdk_turn(
                 pass
             agent._claude_sdk_session = None
 
-    if not getattr(turn, "should_retire", False):
-        # Persist the SDK session id for restart/eviction/interrupt resume.
-        thread_id = getattr(turn, "thread_id", None)
-        if thread_id:
-            _store_sdk_session_id(agent, thread_id)
-
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
         # Early-return path bypasses conversation_loop's per-step persistence;
@@ -603,6 +612,15 @@ def run_claude_agent_sdk_turn(
                 logger.debug(
                     "claude-sdk projected-message flush failed", exc_info=True
                 )
+
+    if not getattr(turn, "should_retire", False):
+        # Persist the SDK session id for restart/eviction/interrupt resume.
+        # AFTER the flush on purpose: the flush's _ensure_db_session retry is
+        # what (re)creates the session row when turn-start persistence hit a
+        # transient lock — storing first would silently discard the id.
+        thread_id = getattr(turn, "thread_id", None)
+        if thread_id:
+            _store_sdk_session_id(agent, thread_id)
 
     # Counter ticks — _turns_since_memory/_user_turn_count are incremented by
     # run_conversation()'s pre-loop block; only _iters_since_skill is ours.

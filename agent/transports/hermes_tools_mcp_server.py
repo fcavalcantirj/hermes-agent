@@ -224,6 +224,22 @@ def dispatch_session_search(kwargs: dict) -> str:
             "success": False,
             "error": f"session_search unavailable: cannot open state DB read-only: {exc}",
         })
+    try:
+        # A present-but-uninitialized DB (0-byte file from a crashed first
+        # init) opens fine and would return a SILENT empty result — the
+        # exact failure the missing-file guard above exists to prevent.
+        # Probe the schema and degrade explicitly instead.
+        db.get_session("__schema-probe__")
+    except Exception as exc:
+        try:
+            db.close()
+        except Exception:
+            pass
+        return json.dumps({
+            "success": False,
+            "error": f"session_search unavailable: state DB not initialized: {exc}",
+        })
+
     def _run(query: str) -> str:
         return session_search_tool.session_search(
             query=query,

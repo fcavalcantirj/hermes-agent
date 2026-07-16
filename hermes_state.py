@@ -142,6 +142,13 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 21
 
+
+def _fts_object_missing(exc: BaseException) -> bool:
+    """True when an FTS probe failure means the table/module is ABSENT
+    (disable search) rather than transiently unavailable (keep it on)."""
+    msg = str(exc).lower()
+    return "no such table" in msg or "no such module" in msg
+
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
 # sanitizer/runtime behavior predictable under adversarial input.
@@ -1041,12 +1048,16 @@ class SessionDB:
                 # Probe FTS availability with SELECTs (read-only-safe).
                 # Without this, search_messages() sees _fts_enabled=False and
                 # silently returns [] on every read-only handle — a false
-                # empty, not a degrade.
+                # empty, not a degrade. Only a MISSING fts object disables
+                # search: a transient error (e.g. "database is locked"
+                # during a checkpoint) must not latch a silent false-empty
+                # for the handle's lifetime — leave enabled and let the
+                # query surface the error visibly.
                 try:
                     self._conn.execute("SELECT 1 FROM messages_fts LIMIT 1")
                     self._fts_enabled = True
-                except sqlite3.Error:
-                    self._fts_enabled = False
+                except sqlite3.Error as exc:
+                    self._fts_enabled = not _fts_object_missing(exc)
                 try:
                     self._conn.execute(
                         "SELECT 1 FROM messages_fts_trigram LIMIT 1"

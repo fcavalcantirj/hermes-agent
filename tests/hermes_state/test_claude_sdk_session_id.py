@@ -37,3 +37,16 @@ def test_new_session_row_never_inherits_an_id(tmp_path):
         assert db.get_session("sess-new")["claude_sdk_session_id"] is None
     finally:
         db.close()
+
+
+def test_fts_probe_error_classifier():
+    # Validator C2: only a MISSING fts object may disable read-only search;
+    # a transient lock must never latch a silent false-empty.
+    import sqlite3
+
+    from hermes_state import _fts_object_missing
+
+    assert _fts_object_missing(sqlite3.OperationalError("no such table: messages_fts"))
+    assert _fts_object_missing(sqlite3.OperationalError("no such module: fts5"))
+    assert not _fts_object_missing(sqlite3.OperationalError("database is locked"))
+    assert not _fts_object_missing(sqlite3.OperationalError("disk I/O error"))

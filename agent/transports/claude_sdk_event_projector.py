@@ -121,7 +121,16 @@ class ClaudeSdkEventProjector:
                 thinking = getattr(block, "thinking", "") or ""
                 if thinking:
                     self._pending_thinking.append(thinking)
-            elif bname in ("ToolUseBlock", "ServerToolUseBlock"):
+            elif bname == "ServerToolUseBlock":
+                # Server tools (web_search, web_fetch, ...) execute API-side;
+                # their results arrive as ServerToolResultBlocks inside the
+                # SAME assistant message, never as a {role:'tool'} echo — an
+                # OpenAI-shaped tool_calls entry here would persist a
+                # dangling tool_call_id that breaks replay through native
+                # provider paths. The tool's textual outcome already arrives
+                # in the assistant text; nothing to project here.
+                pass
+            elif bname == "ToolUseBlock":
                 call_id = getattr(block, "id", "") or ""
                 tool_calls.append(
                     {
