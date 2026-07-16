@@ -548,6 +548,29 @@ class TestMcpEnvMinimal:
         assert turn.should_retire
         assert "ANTHROPIC_AUTH_TOKEN" in (turn.error or "")
 
+    def test_allow_metered_key_via_config_yaml(self, monkeypatch):
+        # The explicit override is a config.yaml key (AGENTS.md: behavioral
+        # settings live in config, not env); the guard steps aside and the
+        # fake-backed session starts normally.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_ALLOW_API_KEY", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"allow_metered_key": True}}
+            },
+        )
+        session, _holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            turn = session.run_turn("ping")
+        finally:
+            session.close()
+        assert not turn.should_retire
+        assert turn.error is None
+
     def test_half_connected_client_is_reaped_on_close(self):
         # Validator C6: on a connect failure the client was assigned only
         # AFTER connect() returned, so close() skipped disconnect and the
@@ -814,6 +837,42 @@ class TestStreaming:
 
     def test_option_absent_by_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_CLAUDE_SDK_STREAMING", raising=False)
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert "include_partial_messages" not in holder["client"].options
+
+    def test_config_yaml_is_the_operator_interface(self, monkeypatch):
+        # AGENTS.md: behavioral settings live in config.yaml, not env.
+        # agent.claude_agent_sdk.streaming turns the option on without any env.
+        import hermes_cli.config as cfg
+
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_STREAMING", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": {"streaming": True}}},
+        )
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["include_partial_messages"] is True
+
+    def test_env_override_wins_over_config(self, monkeypatch):
+        # The env var stays as the deployment override (systemd drop-ins)
+        # and wins in BOTH directions — an explicit "0" beats config true.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_CLAUDE_SDK_STREAMING", "0")
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": {"streaming": True}}},
+        )
         session, holder = _make_session(script=[ResultMessage(result="ok")])
         try:
             session.run_turn("ping")
