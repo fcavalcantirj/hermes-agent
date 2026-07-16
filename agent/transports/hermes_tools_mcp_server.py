@@ -54,6 +54,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -61,6 +62,49 @@ import sys
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# JSON Schema type -> Python type mapping for signature generation
+_JSON_TO_PY = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
+    """Build a Python function signature and annotations from a JSON schema.
+
+    Args:
+        schema: JSON Schema dict with "properties" and "required" keys.
+
+    Returns:
+        (signature, annotations_dict) where signature has KEYWORD_ONLY params
+        and annotations maps param names to Python types.
+    """
+    props = (schema or {}).get("properties") or {}
+    required = set((schema or {}).get("required") or [])
+    params, annots = [], {}
+
+    for pname, pspec in props.items():
+        if pname.startswith("_"):
+            continue
+        py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        ann, default = (
+            (py, inspect.Parameter.empty)
+            if pname in required
+            else (Optional[py], None)
+        )
+        annots[pname] = ann
+        params.append(
+            inspect.Parameter(
+                pname, inspect.Parameter.KEYWORD_ONLY, annotation=ann, default=default
+            )
+        )
+
+    return inspect.Signature(params, return_annotation=str), annots
 
 
 # Tools we expose. Each name MUST match a registered Hermes tool that
@@ -213,7 +257,7 @@ def _memory_enabled_in_config() -> bool:
 
 
 def _stateless_shim_defs() -> list:
-    """(name, description, handler) triples to register, honoring config.
+    """(name, description, input_schema, handler) 4-tuples to register.
 
     session_search is always defined — a missing state DB degrades to an
     explicit error at call time, which is more diagnosable than an absent
@@ -240,25 +284,44 @@ def _stateless_shim_defs() -> list:
     return defs
 
 
-def _tool_specs() -> list:
-    """(name, description, input_schema, handler) for every served tool.
+def _build_server() -> Any:
+    """Create the FastMCP server with Hermes tools attached. Lazy imports
+    so the module can be imported without the mcp package installed
+    (we degrade to a clear error only when actually run)."""
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError as exc:  # pragma: no cover - install hint
+        raise ImportError(
+            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
+        ) from exc
 
-    Pure Python — no `mcp` import — so the tool surface is unit-testable
-    without the MCP SDK installed. Schemas are the authoritative Hermes
-    registry schemas, served verbatim: the previous FastMCP registration
-    inferred schemas from the handlers' ``**kwargs`` signature, which
-    pydantic rendered as a REQUIRED ``kwargs`` field — so every tool call
-    failed validation before reaching Hermes at all.
-    """
-    from model_tools import get_tool_definitions, handle_function_call
+    # Discover Hermes tools so dispatch works.
+    from model_tools import (
+        get_tool_definitions,
+        handle_function_call,
+    )
 
+    mcp = FastMCP(
+        "hermes-tools",
+        instructions=(
+            "Hermes Agent's tool surface, exposed for use inside a Codex "
+            "session. Use these for capabilities Codex's built-in toolset "
+            "doesn't cover: web search/extract, browser automation, "
+            "subagent delegation, vision, image generation, persistent "
+            "memory, skills, and cross-session search."
+        ),
+    )
+
+    # Pull authoritative Hermes tool schemas for the ones we expose, so
+    # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
         for td in (get_tool_definitions(quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
-    specs = []
+    exposed_count = 0
+
     for name in EXPOSED_TOOLS:
         spec = all_defs.get(name)
         if spec is None:
@@ -270,97 +333,86 @@ def _tool_specs() -> list:
         description = spec.get("description") or f"Hermes {name} tool"
         params_schema = spec.get("parameters") or {"type": "object", "properties": {}}
 
-        def _make_handler(tool_name: str):
-            def _dispatch(arguments: dict) -> str:
+        # FastMCP wants a Python callable. Build a closure that takes the
+        # arguments dict, dispatches via handle_function_call, and returns
+        # the result string. We use add_tool() for full control over the
+        # input schema (FastMCP's @tool() decorator inspects type hints,
+        # which we can't get from a JSON schema at runtime).
+        def _make_handler(tool_name: str, schema: dict | None):
+            sig, annots = _signature_from_schema(schema)
+
+            def _dispatch(**kwargs: Any) -> str:
                 try:
-                    return handle_function_call(tool_name, arguments or {})
+                    # Filter out None values before dispatch so unset optionals
+                    # aren't forwarded to the handler.
+                    args = {k: v for k, v in kwargs.items() if v is not None}
+                    return handle_function_call(tool_name, args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
+
+            _dispatch.__name__ = tool_name
+            _dispatch.__doc__ = description
+            _dispatch.__signature__ = sig
+            _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
-        specs.append((name, description, params_schema, _make_handler(name)))
+        try:
+            mcp.add_tool(
+                _make_handler(name, params_schema),
+                name=name,
+                description=description,
+            )
+        except TypeError:
+            # Older mcp SDK signature — fall back to decorator-style. The
+            # synthesized __signature__ on the handler still drives schema
+            # generation there.
+            handler = _make_handler(name, params_schema)
+            handler = mcp.tool(name=name, description=description)(handler)
 
-    # Stateless agent-loop shims (#26567) — dedicated closures so
-    # handle_function_call's `_AGENT_LOOP_TOOLS` refusal stays intact for
-    # every other caller.
+        exposed_count += 1
+
+    # Stateless agent-loop shims (#26567) — registered as dedicated
+    # closures so handle_function_call's `_AGENT_LOOP_TOOLS` refusal stays
+    # intact for every other caller. Same signature-from-schema mechanics
+    # as the loop above so FastMCP serves the authoritative registry schema.
+    shim_count = 0
     for shim_name, shim_description, shim_schema, shim_fn in _stateless_shim_defs():
+        shim_sig, shim_annots = _signature_from_schema(shim_schema)
 
-        def _make_shim_handler(fn, tool_name: str):
-            def _dispatch(arguments: dict) -> str:
+        def _make_shim_handler(fn, tool_name: str, description: str, sig, annots):
+            def _dispatch(**kwargs: Any) -> str:
                 try:
-                    return fn(arguments or {})
+                    args = {k: v for k, v in kwargs.items() if v is not None}
+                    return fn(args or {})
                 except Exception as exc:
                     logger.exception("shim tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
+
+            _dispatch.__name__ = tool_name
+            _dispatch.__doc__ = description
+            _dispatch.__signature__ = sig
+            _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
-        specs.append((
-            shim_name,
-            shim_description,
-            shim_schema,
-            _make_shim_handler(shim_fn, shim_name),
-        ))
+        shim_handler = _make_shim_handler(
+            shim_fn, shim_name, shim_description, shim_sig, shim_annots
+        )
+        try:
+            mcp.add_tool(shim_handler, name=shim_name, description=shim_description)
+        except TypeError:
+            shim_handler = mcp.tool(name=shim_name, description=shim_description)(
+                shim_handler
+            )
+        shim_count += 1
 
-    return specs
-
-
-def _build_server() -> Any:
-    """Create the MCP server with Hermes tools attached. Lazy imports so the
-    module can be imported without the mcp package installed (we degrade to
-    a clear error only when actually run).
-
-    Uses the low-level ``mcp.server.Server`` API rather than FastMCP: our
-    input schemas are runtime JSON documents from the Hermes registry, and
-    FastMCP can only infer schemas from Python signatures (its inference
-    turned ``**kwargs`` handlers into a required ``kwargs`` field, breaking
-    every call at the validation layer)."""
-    try:
-        import mcp.types as types
-        from mcp.server import Server
-    except ImportError as exc:  # pragma: no cover - install hint
-        raise ImportError(
-            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
-        ) from exc
-
-    import anyio.to_thread
-
-    specs = _tool_specs()
-    by_name = {name: handler for name, _d, _s, handler in specs}
-
-    server = Server(
-        "hermes-tools",
-        instructions=(
-            "Hermes Agent's tool surface, exposed for use inside an "
-            "externally-driven agent loop. Use these for capabilities the "
-            "host toolset doesn't cover: web search/extract, browser "
-            "automation, vision, image generation, persistent memory, "
-            "skills, cross-session search, and kanban."
-        ),
+    logger.info(
+        "hermes-tools MCP server registered %d/%d tools + %d stateless shims",
+        exposed_count,
+        len(EXPOSED_TOOLS),
+        shim_count,
     )
-
-    @server.list_tools()
-    async def _list_tools() -> list:
-        return [
-            types.Tool(name=name, description=description, inputSchema=schema)
-            for name, description, schema, _handler in specs
-        ]
-
-    @server.call_tool()
-    async def _call_tool(name: str, arguments: dict) -> list:
-        handler = by_name.get(name)
-        if handler is None:
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({"error": f"unknown tool: {name}"}),
-            )]
-        # Hermes dispatch is synchronous (and may block on network/disk);
-        # run it off the protocol loop, mirroring FastMCP's behavior.
-        result = await anyio.to_thread.run_sync(lambda: handler(arguments or {}))
-        return [types.TextContent(type="text", text=str(result))]
-
-    logger.info("hermes-tools MCP server serving %d tools", len(specs))
-    return server
+    return mcp
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -385,19 +437,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 
+    # FastMCP runs with stdio transport by default when launched as a
+    # subprocess.
     try:
-        import anyio
-        from mcp.server.stdio import stdio_server
-
-        async def _serve() -> None:
-            async with stdio_server() as (read_stream, write_stream):
-                await server.run(
-                    read_stream,
-                    write_stream,
-                    server.create_initialization_options(),
-                )
-
-        anyio.run(_serve)
+        server.run()
     except KeyboardInterrupt:
         return 0
     except Exception as exc:

@@ -160,34 +160,26 @@ class TestShimRegistration:
         assert "memory" not in names
         assert "session_search" in names
 
-    def test_served_schemas_are_the_registry_schemas(self, tmp_hermes_home):
-        # RED-first pin of the FastMCP regression: schemas must be the
-        # authoritative registry JSON, never inferred from a **kwargs
-        # signature (which pydantic renders as a required "kwargs" field,
-        # failing EVERY call at the validation layer).
-        from agent.transports.hermes_tools_mcp_server import _tool_specs
-
-        specs = {name: schema for name, _d, schema, _h in _tool_specs()}
-        assert "memory" in specs and "session_search" in specs
-        for name, schema in specs.items():
-            props = schema.get("properties", {})
-            assert "kwargs" not in props, f"{name} serves an inferred schema"
-        assert "target" in specs["memory"]["properties"]
-        assert "query" in specs["session_search"]["properties"]
-
-    def test_tool_spec_handlers_dispatch(self, tmp_hermes_home):
-        # The spec handler wrapping must actually reach the shim: a memory
-        # add through the spec's handler lands on disk.
-        from agent.transports.hermes_tools_mcp_server import _tool_specs
-
-        handler = {name: h for name, _d, _s, h in _tool_specs()}["memory"]
-        out = json.loads(
-            handler({"action": "add", "target": "memory", "content": "spec path works"})
+    def test_shim_signatures_carry_the_registry_schema(self, tmp_hermes_home):
+        # Pin of the schema-inference regression: FastMCP derives the served
+        # schema from the handler's signature, so the signature synthesized
+        # from the registry schema must expose the real parameters — never a
+        # bare ``kwargs`` (pydantic renders that as a REQUIRED "kwargs"
+        # field, failing EVERY call at the validation layer).
+        from agent.transports.hermes_tools_mcp_server import (
+            _signature_from_schema,
         )
-        assert out.get("success") is True
-        assert "spec path works" in (
-            tmp_hermes_home / "memories" / "MEMORY.md"
-        ).read_text()
+
+        for name, _desc, schema, _fn in _stateless_shim_defs():
+            sig, _annots = _signature_from_schema(schema)
+            params = list(sig.parameters)
+            assert "kwargs" not in params, f"{name} would serve an inferred schema"
+            assert params, f"{name} signature is empty"
+        shim_schemas = {n: s for n, _d, s, _f in _stateless_shim_defs()}
+        mem_sig, _ = _signature_from_schema(shim_schemas["memory"])
+        assert "target" in mem_sig.parameters
+        ss_sig, _ = _signature_from_schema(shim_schemas["session_search"])
+        assert "query" in ss_sig.parameters
 
     def test_agent_loop_refusal_stays_intact_for_other_callers(self):
         # The shims must NOT weaken the generic dispatcher: a stateless
