@@ -689,6 +689,11 @@ class TestSystemPromptAppend:
         assert "You have persistent memory across sessions" in out
         assert stripped in out
         assert "save it as a skill with the skill tool" not in out
+        # Disambiguation addendum (caught live): the claude_code preset has
+        # its own file-based memory convention; the append must pin the
+        # hermes-tools memory tool as the ONLY durable store.
+        assert "ONLY durable memory" in out
+        assert "hermes-tools MCP server" in out
 
     def test_skills_guidance_never_injected(self, tmp_path, monkeypatch):
         # SKILLS_GUIDANCE instructs skill_manage — unexposed by design.

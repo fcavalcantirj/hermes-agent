@@ -52,6 +52,19 @@ _SKILL_MANAGE_INDEX_SENTENCE = (
     "If a skill has issues, fix it with skill_manage(action='patch')."
 )
 
+# The claude_code preset ships its OWN file-based memory convention (a
+# per-project memory directory). Caught live: told a durable preference in
+# passing, the model wrote harness memory files instead of calling the
+# hermes-tools `memory` tool — the fact never reached the store this append
+# injects. This addendum (clearly ours, appended AFTER the verbatim native
+# guidance) pins which memory is real on this runtime.
+_MEMORY_TOOL_DISAMBIGUATION = (
+    "On this runtime your ONLY durable memory is the `memory` tool from the "
+    "hermes-tools MCP server. Never write remembered facts to local files or "
+    "any memory directory — those are not shared and will not be injected "
+    "into future sessions; only the memory tool's store is."
+)
+
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
     return (
@@ -153,7 +166,11 @@ def build_system_prompt_append(
         try:
             from agent.prompt_builder import MEMORY_GUIDANCE
 
-            blocks.append(_strip_uncallable_tool_guidance(MEMORY_GUIDANCE))
+            blocks.append(
+                _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
+                + "\n"
+                + _MEMORY_TOOL_DISAMBIGUATION
+            )
         except Exception:  # pragma: no cover
             logger.debug("memory guidance unavailable", exc_info=True)
 
