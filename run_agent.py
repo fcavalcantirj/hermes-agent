@@ -3554,6 +3554,19 @@ class AIAgent:
         except Exception:
             pass
 
+        # Disconnect the claude-agent-sdk session: it owns a loop thread and
+        # a Claude Code CLI subprocess that would otherwise outlive the
+        # evicted agent forever. Continuity survives eviction regardless —
+        # the rebuilt agent RESUMES via the persisted claude_sdk_session_id
+        # on the session row. (#25267)
+        try:
+            sdk_session = getattr(self, "_claude_sdk_session", None)
+            if sdk_session is not None:
+                self._claude_sdk_session = None
+                sdk_session.close()
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
