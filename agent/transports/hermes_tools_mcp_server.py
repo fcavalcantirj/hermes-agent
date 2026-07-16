@@ -257,7 +257,7 @@ def _memory_enabled_in_config() -> bool:
 
 
 def _stateless_shim_defs() -> list:
-    """(name, description, handler) triples to register, honoring config.
+    """(name, description, input_schema, handler) 4-tuples to register.
 
     session_search is always defined — a missing state DB degrades to an
     explicit error at call time, which is more diagnosable than an absent
@@ -267,13 +267,18 @@ def _stateless_shim_defs() -> list:
     if _memory_enabled_in_config():
         from tools.memory_tool import MEMORY_SCHEMA
 
-        defs.append(("memory", MEMORY_SCHEMA.get("description", "Hermes memory tool"),
-                     dispatch_memory))
+        defs.append((
+            "memory",
+            MEMORY_SCHEMA.get("description", "Hermes memory tool"),
+            MEMORY_SCHEMA.get("parameters") or {"type": "object", "properties": {}},
+            dispatch_memory,
+        ))
     from tools.session_search_tool import SESSION_SEARCH_SCHEMA
 
     defs.append((
         "session_search",
         SESSION_SEARCH_SCHEMA.get("description", "Search past Hermes sessions"),
+        SESSION_SEARCH_SCHEMA.get("parameters") or {"type": "object", "properties": {}},
         dispatch_session_search,
     ))
     return defs
@@ -369,22 +374,30 @@ def _build_server() -> Any:
 
     # Stateless agent-loop shims (#26567) — registered as dedicated
     # closures so handle_function_call's `_AGENT_LOOP_TOOLS` refusal stays
-    # intact for every other caller.
+    # intact for every other caller. Same signature-from-schema mechanics
+    # as the loop above so FastMCP serves the authoritative registry schema.
     shim_count = 0
-    for shim_name, shim_description, shim_fn in _stateless_shim_defs():
+    for shim_name, shim_description, shim_schema, shim_fn in _stateless_shim_defs():
+        shim_sig, shim_annots = _signature_from_schema(shim_schema)
 
-        def _make_shim_handler(fn, tool_name: str, description: str):
+        def _make_shim_handler(fn, tool_name: str, description: str, sig, annots):
             def _dispatch(**kwargs: Any) -> str:
                 try:
-                    return fn(kwargs or {})
+                    args = {k: v for k, v in kwargs.items() if v is not None}
+                    return fn(args or {})
                 except Exception as exc:
                     logger.exception("shim tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
+
             _dispatch.__name__ = tool_name
             _dispatch.__doc__ = description
+            _dispatch.__signature__ = sig
+            _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
-        shim_handler = _make_shim_handler(shim_fn, shim_name, shim_description)
+        shim_handler = _make_shim_handler(
+            shim_fn, shim_name, shim_description, shim_sig, shim_annots
+        )
         try:
             mcp.add_tool(shim_handler, name=shim_name, description=shim_description)
         except TypeError:

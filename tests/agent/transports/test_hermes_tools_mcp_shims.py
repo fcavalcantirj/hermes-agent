@@ -147,7 +147,7 @@ class TestSessionSearchShim:
 
 class TestShimRegistration:
     def test_both_shims_defined_by_default(self, tmp_hermes_home):
-        names = [name for name, _desc, _fn in _stateless_shim_defs()]
+        names = [name for name, _desc, _schema, _fn in _stateless_shim_defs()]
         assert names == ["memory", "session_search"]
 
     def test_memory_shim_respects_config_disable(self, tmp_hermes_home, monkeypatch):
@@ -156,9 +156,30 @@ class TestShimRegistration:
         monkeypatch.setattr(
             cfg, "load_config", lambda *a, **k: {"memory": {"memory_enabled": False}}
         )
-        names = [name for name, _desc, _fn in _stateless_shim_defs()]
+        names = [name for name, _desc, _schema, _fn in _stateless_shim_defs()]
         assert "memory" not in names
         assert "session_search" in names
+
+    def test_shim_signatures_carry_the_registry_schema(self, tmp_hermes_home):
+        # Pin of the schema-inference regression: FastMCP derives the served
+        # schema from the handler's signature, so the signature synthesized
+        # from the registry schema must expose the real parameters — never a
+        # bare ``kwargs`` (pydantic renders that as a REQUIRED "kwargs"
+        # field, failing EVERY call at the validation layer).
+        from agent.transports.hermes_tools_mcp_server import (
+            _signature_from_schema,
+        )
+
+        for name, _desc, schema, _fn in _stateless_shim_defs():
+            sig, _annots = _signature_from_schema(schema)
+            params = list(sig.parameters)
+            assert "kwargs" not in params, f"{name} would serve an inferred schema"
+            assert params, f"{name} signature is empty"
+        shim_schemas = {n: s for n, _d, s, _f in _stateless_shim_defs()}
+        mem_sig, _ = _signature_from_schema(shim_schemas["memory"])
+        assert "target" in mem_sig.parameters
+        ss_sig, _ = _signature_from_schema(shim_schemas["session_search"])
+        assert "query" in ss_sig.parameters
 
     def test_agent_loop_refusal_stays_intact_for_other_callers(self):
         # The shims must NOT weaken the generic dispatcher: a stateless
