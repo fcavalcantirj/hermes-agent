@@ -688,6 +688,22 @@ class TestContinuity:
         assert len(instances) == 1
         assert result["partial"] is True
 
+    def test_effective_prompt_snapshot_replaces_native_one(self, monkeypatch):
+        # The prologue persists Hermes' native composed prompt — a prompt
+        # this runtime never sends. The runtime overwrites the snapshot with
+        # the EFFECTIVE prompt so the audit trail tells the truth.
+        agent, db = self._db_agent()
+        self._spy_sessions(monkeypatch, [_make_turn()])
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        args = db.update_system_prompt.call_args
+        assert args is not None
+        assert args.args[0] == "sess-1"
+        assert args.args[1].startswith("[claude_code preset]")
+
+
 class TestSessionResumeField:
     def test_resume_rides_options_when_set(self):
         session, holder = _make_session(

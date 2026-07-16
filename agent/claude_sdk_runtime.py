@@ -469,6 +469,16 @@ def run_claude_agent_sdk_turn(
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
         )
+        # The prologue persisted Hermes' native composed prompt — a prompt
+        # this runtime never sends. Overwrite the snapshot with the
+        # EFFECTIVE prompt so the audit trail tells the truth.
+        try:
+            if getattr(agent, "_session_db", None) and agent.session_id:
+                agent._session_db.update_system_prompt(
+                    agent.session_id, "[claude_code preset]\n\n" + (append or "")
+                )
+        except Exception:
+            logger.debug("effective-prompt snapshot failed", exc_info=True)
 
     # NOTE: the user message is ALREADY appended to messages by the standard
     # run_conversation() flow before the early return reaches us. Do NOT
