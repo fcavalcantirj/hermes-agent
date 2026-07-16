@@ -32,48 +32,165 @@ def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
         return ""
 
 
-def build_system_prompt_append() -> Optional[str]:
+# Total append budget. Blocks are included whole, in priority order; a block
+# that does not fit is SKIPPED (never truncated mid-block) and later, smaller
+# blocks may still be included. Priority = assembly order below: soul,
+# session line, platform hint, user profile, memory, memory guidance,
+# session_search guidance, skills index.
+_APPEND_TOTAL_MAX_CHARS = 20000
+
+# The one MEMORY_GUIDANCE sentence that instructs the skill tool —
+# skill_manage is NOT exposed through the MCP shims, and guidance must only
+# describe callable tools. Stripped as a pure deletion; the pin test goes
+# red if upstream rewords the sentence.
+_SKILL_TOOL_SENTENCE = (
+    "If you've discovered a new way to do something, solved a problem that could be "
+    "necessary later, save it as a skill with the skill tool.\n"
+)
+
+
+def _strip_uncallable_tool_guidance(text: str) -> str:
+    return text.replace(_SKILL_TOOL_SENTENCE, "")
+
+
+def build_system_prompt_append(
+    platform: Optional[str] = None,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Optional[str]:
     """Compose the system-prompt append for the SDK session.
 
-    Sources, in order:
-      1. An operator-owned persona/soul file (HERMES_CLAUDE_SDK_APPEND_FILE)
-         — identity lives here; without it the agent introduces itself as
-         plain Claude Code.
-      2. Hermes' native memory files (~/.hermes/USER.md, MEMORY.md) — the
-         learning loop's bounded sticky notes, injected whole so the SDK
-         brain actually sees what Hermes has learned. (Hermes' own prompt
-         composer is bypassed on this runtime; this is its replacement.)
+    Hermes' own prompt composer is bypassed on this runtime; this is its
+    replacement, built from the SAME native builders (W2 composer parity):
 
-    Read at session creation: edits apply on the next session (retire or
-    gateway restart), not mid-session.
+      1. Operator persona/soul file (HERMES_CLAUDE_SDK_APPEND_FILE) —
+         identity lives here.
+      2. Session line — the native volatile-tier format (date-only for
+         prefix-cache stability) + session id / model / provider.
+      3. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
+      4. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
+         verbatim, fill gauge included (the same store the memory MCP shim
+         writes; config-gated on memory.memory_enabled).
+      5. MEMORY_GUIDANCE (minus its skill-tool sentence — skill_manage is
+         not exposed) + SESSION_SEARCH_GUIDANCE — the behavior contract for
+         the two shim tools.
+      6. The skills index (build_skills_system_prompt) for the read-side
+         skill_view/skills_list tools. SKILLS_GUIDANCE is deliberately
+         ABSENT (it instructs skill_manage).
+
+    Read at session creation: edits apply on the next session (retire, /new,
+    or gateway restart), not mid-session — the same snapshot invariant the
+    native composer keeps for prefix-cache stability.
     """
-    parts: list[str] = []
+    blocks: list[str] = []
+
     soul_path = os.environ.get("HERMES_CLAUDE_SDK_APPEND_FILE", "").strip()
     if soul_path:
         soul = _read_capped(soul_path)
         if soul:
-            parts.append(soul)
+            blocks.append(soul)
         else:
             logger.warning(
                 "HERMES_CLAUDE_SDK_APPEND_FILE=%s is set but unreadable/empty",
                 soul_path,
             )
-    # ONE canonical location: the memory tool's own memories/ dir (the same
-    # store the stateless MCP shim writes through — #26567). Reading the
-    # HERMES_HOME root here was a path bug: tool writes landed where this
-    # append never looked.
-    try:
-        from tools.memory_tool import get_memory_dir
 
-        memories_dir = str(get_memory_dir())
-    except Exception:  # pragma: no cover - defensive fallback, same layout
-        hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-        memories_dir = os.path.join(hermes_home, "memories")
-    for filename, label in (("USER.md", "About the user"), ("MEMORY.md", "Working memory")):
-        content = _read_capped(os.path.join(memories_dir, filename))
-        if content:
-            parts.append(f"## {label} (Hermes memory — curated across sessions)\n{content}")
-    return "\n\n".join(parts) or None
+    # Session line — mirrors the native composer's volatile tier
+    # (system_prompt.py): date-only so the append stays byte-stable all day.
+    try:
+        from hermes_time import now as _hermes_now
+
+        session_line = (
+            f"Conversation started: {_hermes_now().strftime('%A, %B %d, %Y')}"
+        )
+        if session_id:
+            session_line += f"\nSession ID: {session_id}"
+        if model:
+            session_line += f"\nModel: {model}"
+        session_line += "\nProvider: claude-agent-sdk (Claude subscription)"
+        blocks.append(session_line)
+    except Exception:  # pragma: no cover - never block session creation
+        logger.debug("session line composition failed", exc_info=True)
+
+    if platform:
+        try:
+            from agent.prompt_builder import PLATFORM_HINTS
+
+            hint = PLATFORM_HINTS.get(str(platform).lower().strip())
+            if hint:
+                blocks.append(hint.strip())
+        except Exception:  # pragma: no cover
+            logger.debug("platform hint lookup failed", exc_info=True)
+
+    # Memory blocks + guidance — gated on the same config predicate that
+    # decides whether the memory shim is exposed at all.
+    try:
+        from agent.transports.hermes_tools_mcp_server import (
+            _memory_enabled_in_config,
+        )
+
+        memory_on = _memory_enabled_in_config()
+    except Exception:  # pragma: no cover
+        memory_on = True
+    if memory_on:
+        try:
+            from tools.memory_tool import load_on_disk_store
+
+            store = load_on_disk_store()
+            for target in ("user", "memory"):
+                block = store.format_for_system_prompt(target)
+                if block:
+                    blocks.append(block)
+        except Exception:
+            logger.debug("memory block composition failed", exc_info=True)
+        try:
+            from agent.prompt_builder import MEMORY_GUIDANCE
+
+            blocks.append(_strip_uncallable_tool_guidance(MEMORY_GUIDANCE))
+        except Exception:  # pragma: no cover
+            logger.debug("memory guidance unavailable", exc_info=True)
+
+    # session_search is always served (a missing DB degrades to an explicit
+    # error at call time), so its guidance always ships.
+    try:
+        from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+
+        blocks.append(SESSION_SEARCH_GUIDANCE)
+    except Exception:  # pragma: no cover
+        logger.debug("session_search guidance unavailable", exc_info=True)
+
+    # Skills index for the read-side tools, filtered to the honest
+    # MCP-exposed surface.
+    try:
+        from agent import prompt_builder
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+
+        index = prompt_builder.build_skills_system_prompt(
+            available_tools=set(EXPOSED_TOOLS) | {"memory", "session_search"},
+        )
+        if index:
+            blocks.append(index)
+    except Exception:  # pragma: no cover
+        logger.debug("skills index composition failed", exc_info=True)
+
+    # Whole-block budget: include each block only if it fits; skipping an
+    # oversized block never evicts later, smaller ones.
+    out_parts: list[str] = []
+    used = 0
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        cost = len(block) + (2 if out_parts else 0)
+        if used + cost > _APPEND_TOTAL_MAX_CHARS:
+            logger.debug(
+                "append budget: skipping a %d-char block (used %d/%d)",
+                len(block), used, _APPEND_TOTAL_MAX_CHARS,
+            )
+            continue
+        out_parts.append(block)
+        used += cost
+    return "\n\n".join(out_parts) or None
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -246,7 +363,11 @@ def run_claude_agent_sdk_turn(
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
             on_tool_started=_on_tool_started,
-            system_prompt_append=build_system_prompt_append(),
+            system_prompt_append=build_system_prompt_append(
+                platform=getattr(agent, "platform", None),
+                session_id=getattr(agent, "session_id", None),
+                model=getattr(agent, "model", None),
+            ),
             hermes_session_id=getattr(agent, "session_id", None),
         )
 
