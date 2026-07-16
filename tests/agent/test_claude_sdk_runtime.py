@@ -367,6 +367,7 @@ def _make_agent():
     agent._claude_sdk_session = MagicMock()
     agent._claude_sdk_session.run_turn.return_value = _make_turn()
     agent.tool_progress_callback = None
+    agent._interrupt_requested = False
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
     agent.valid_tool_names = set()
@@ -584,6 +585,65 @@ class TestInterruptRoutesToSdkSession:
         agent = self._make_real_agent()
         agent._claude_sdk_session = None
         agent.interrupt()  # must not raise
+
+    def test_release_clients_disconnects_sdk_session(self):
+        # Adversarial-review HIGH: the gateway's ROUTINE evictions (LRU cap,
+        # idle-TTL sweep, model switch) release via release_clients(), which
+        # never touched the SDK session — leaking the loop thread + the
+        # Claude CLI subprocess per eviction on a 24/7 gateway.
+        agent = self._make_real_agent()
+        sdk_session = MagicMock()
+        agent._claude_sdk_session = sdk_session
+        agent.release_clients()
+        sdk_session.close.assert_called_once()
+        assert agent._claude_sdk_session is None
+
+    def test_pending_interrupt_flag_short_circuits_cold_turn(self, monkeypatch):
+        # Adversarial-review MEDIUM: an interrupt landing before the SDK
+        # session exists set only agent._interrupt_requested, which the SDK
+        # path never read — the turn ran uninterruptible for up to 600s.
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        instances = []
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                instances.append(self)
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._interrupt_requested = True
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert instances == []  # no session created, no subscription burn
+        assert result["completed"] is False and result["partial"] is True
+        assert agent._interrupt_requested is False  # consumed, next turn runs
+
+    def test_pre_set_interrupt_event_honored_then_next_turn_runs(self):
+        # Adversarial-review MEDIUM: run_turn unconditionally CLEARED the
+        # interrupt event after connect — an interrupt arriving during the
+        # (up to 60s) connect window was silently erased. It must instead be
+        # honored by THIS turn, and must not bleed into the next one.
+        session, holder = _make_session(
+            script=[ResultMessage(result="ok")]
+        )
+        try:
+            session.ensure_started()
+            session.request_interrupt()
+            turn1 = session.run_turn("first")
+            assert turn1.interrupted is True
+            assert holder["client"].queried == []  # never reached the model
+            turn2 = session.run_turn("second")
+            assert turn2.interrupted is False
+            assert holder["client"].queried == ["second"]
+        finally:
+            session.close()
 
 
 # ---------- streaming deltas (W4, env-gated default OFF) ----------
@@ -805,6 +865,24 @@ class TestContinuity:
         assert instances[1].inputs[0].startswith("[Continuity digest")
         db.update_claude_sdk_session_id.assert_any_call("sess-1", None)
 
+    def test_interrupted_turn_retires_client_but_persists_resume_id(self, monkeypatch):
+        # Adversarial-review HIGH: breaking out of receive_response() on
+        # interrupt leaves the interrupted turn's ResultMessage queued in the
+        # client's stream — a REUSED client would serve it as the NEXT turn's
+        # answer. The runtime must retire the client (clean stream) while
+        # persisting the SDK id, so the next turn RESUMES the conversation.
+        agent, db = self._db_agent()
+        self._spy_sessions(monkeypatch, [_make_turn(
+            interrupted=True, final_text="partial answer", thread_id="sdk-live-3",
+        )])
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert agent._claude_sdk_session is None  # client retired
+        db.update_claude_sdk_session_id.assert_called_with("sess-1", "sdk-live-3")
+        assert result["partial"] is True
+
     def test_fresh_retire_does_not_retry(self, monkeypatch):
         # Only a RESUMED session earns the retry — a fresh session that
         # retires is a real error and must surface, never loop.
@@ -1011,6 +1089,11 @@ class TestSystemPromptAppend:
         # hermes-tools memory tool as the ONLY durable store.
         assert "ONLY durable memory" in out
         assert "hermes-tools MCP server" in out
+        # Reworded after the adversarial review PROVED the preset's memory
+        # dir DOES persist per-cwd: the addendum must state true facts
+        # (unmanaged/disposable), never the false "will not be injected".
+        assert "disposable" in out
+        assert "will not be injected" not in out
 
     def test_skills_guidance_never_injected(self, tmp_path, monkeypatch):
         # SKILLS_GUIDANCE instructs skill_manage — unexposed by design.
