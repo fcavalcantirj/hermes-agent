@@ -122,6 +122,43 @@ class TestSessionSearchShim:
         dispatch_session_search({"query": "auth"})
         assert captured.get("current_session_id") == "sess-current-9"
 
+    def test_zero_hit_multiterm_query_relaxes_to_or(self, tmp_hermes_home, monkeypatch):
+        # FTS5 ANDs terms: models write "topic word word word" queries and get
+        # 0 hits for content that matches one distinctive term (observed live
+        # twice). The shim retries ONCE with OR-joined terms, deterministic,
+        # and annotates the result honestly.
+        db_path = tmp_hermes_home / "state.db"
+        self._seed_db(db_path)
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
+        out = json.loads(
+            dispatch_session_search({"query": "auth refactor deployment window"})
+        )
+        assert out.get("count", 0) >= 1
+        assert out.get("relaxed_query") == "auth OR refactor OR deployment OR window"
+        assert "sess-hist-1" in json.dumps(out)
+
+    def test_explicit_fts_operators_are_never_relaxed(self, tmp_hermes_home, monkeypatch):
+        # A query that already uses FTS operators is the caller's intent —
+        # no second-guessing.
+        db_path = tmp_hermes_home / "state.db"
+        self._seed_db(db_path)
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
+        out = json.loads(
+            dispatch_session_search({"query": '"deployment window" OR rollout'})
+        )
+        assert out.get("count") == 0
+        assert "relaxed_query" not in out
+
+    def test_zero_hit_single_term_returns_honest_zero(self, tmp_hermes_home, monkeypatch):
+        # Nothing to relax on a single term: an honest empty result, never a
+        # fabricated one.
+        db_path = tmp_hermes_home / "state.db"
+        self._seed_db(db_path)
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
+        out = json.loads(dispatch_session_search({"query": "kubernetes"}))
+        assert out.get("count") == 0
+        assert "relaxed_query" not in out
+
     def test_db_opened_read_only(self, tmp_hermes_home, monkeypatch):
         # The shim must never hand a writable DB handle to a model-facing
         # subprocess. SessionDB(read_only=True) attaches with mode=ro.

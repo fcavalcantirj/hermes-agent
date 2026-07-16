@@ -224,9 +224,9 @@ def dispatch_session_search(kwargs: dict) -> str:
             "success": False,
             "error": f"session_search unavailable: cannot open state DB read-only: {exc}",
         })
-    try:
+    def _run(query: str) -> str:
         return session_search_tool.session_search(
-            query=kwargs.get("query") or "",
+            query=query,
             role_filter=kwargs.get("role_filter"),
             limit=kwargs.get("limit", 3),
             session_id=kwargs.get("session_id"),
@@ -237,6 +237,41 @@ def dispatch_session_search(kwargs: dict) -> str:
             db=db,
             current_session_id=os.environ.get(_SESSION_ID_ENV, "").strip() or None,
         )
+
+    try:
+        query = kwargs.get("query") or ""
+        result = _run(query)
+        # Deterministic OR-relaxation: FTS5 ANDs terms, and models routinely
+        # write "topic word word word" discovery queries that miss content
+        # matching one distinctive term. On a ZERO-hit multi-term query with
+        # no explicit FTS operators, retry ONCE with the terms OR-joined and
+        # annotate the result — never silently, never for a query that
+        # states its own operators, never on a single term.
+        try:
+            parsed = json.loads(result)
+            terms = query.split()
+            has_operators = any(
+                op in query for op in ('"', "*", " OR ", " NOT ", " AND ")
+            )
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("mode") == "discover"
+                and parsed.get("count") == 0
+                and len(terms) >= 2
+                and not has_operators
+            ):
+                relaxed_query = " OR ".join(terms)
+                relaxed = json.loads(_run(relaxed_query))
+                if isinstance(relaxed, dict) and relaxed.get("count", 0) > 0:
+                    relaxed["relaxed_query"] = relaxed_query
+                    relaxed["note"] = (
+                        "No result matched ALL terms (FTS ANDs them); showing "
+                        "matches for ANY term instead."
+                    )
+                    return json.dumps(relaxed)
+        except Exception:
+            logger.debug("session_search relaxation skipped", exc_info=True)
+        return result
     finally:
         try:
             db.close()

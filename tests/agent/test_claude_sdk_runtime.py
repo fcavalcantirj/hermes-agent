@@ -711,6 +711,8 @@ class TestSystemPromptAppend:
         out = build_system_prompt_append()
         assert out is not None
         assert SESSION_SEARCH_GUIDANCE in out
+        # Query-style addendum (observed live: ANDy multi-term queries miss).
+        assert "ALL terms must match" in out
 
     def test_memory_disabled_removes_blocks_and_guidance(self, tmp_path, monkeypatch):
         from agent.claude_sdk_runtime import build_system_prompt_append
