@@ -453,6 +453,55 @@ class TestBackgroundReviewSuppressed:
         assert agent._iters_since_skill == 0
 
 
+# ---------- hermes session id plumbing to the MCP shims (#26567) ----------
+
+
+class TestHermesSessionIdPlumbing:
+    def test_session_id_rides_mcp_env(self):
+        session, holder = _make_session(
+            script=[ResultMessage(result="ok")], hermes_session_id="sess-42"
+        )
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        env = holder["client"].options["mcp_servers"]["hermes-tools"]["env"]
+        assert env["HERMES_MCP_SESSION_ID"] == "sess-42"
+
+    def test_no_session_id_no_env_var(self):
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        env = holder["client"].options["mcp_servers"]["hermes-tools"]["env"]
+        assert "HERMES_MCP_SESSION_ID" not in env
+
+    def test_runtime_passes_agent_session_id(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        assert captured.get("hermes_session_id") == "sess-1"
+
+
 # ---------- agent close() releases the SDK session ----------
 
 
