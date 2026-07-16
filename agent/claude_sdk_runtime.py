@@ -570,16 +570,20 @@ def run_claude_agent_sdk_turn(
                 continue
         break
 
-    if getattr(turn, "interrupted", False) and agent._claude_sdk_session is not None:
-        # The abandoned stream may still hold the interrupted turn's
-        # ResultMessage; a REUSED client would serve it as the NEXT turn's
-        # answer. Retire the client — the persisted id below lets the next
-        # turn RESUME the same SDK conversation on a clean stream.
-        try:
-            agent._claude_sdk_session.close()
-        except Exception:
-            pass
-        agent._claude_sdk_session = None
+    if getattr(turn, "interrupted", False):
+        # The interrupt was honored by THIS turn — consume the agent-level
+        # flag so the next turn is not short-circuited by it.
+        agent._interrupt_requested = False
+        if agent._claude_sdk_session is not None:
+            # The abandoned stream may still hold the interrupted turn's
+            # ResultMessage; a REUSED client would serve it as the NEXT
+            # turn's answer. Retire the client — the persisted id below lets
+            # the next turn RESUME the same SDK conversation cleanly.
+            try:
+                agent._claude_sdk_session.close()
+            except Exception:
+                pass
+            agent._claude_sdk_session = None
 
     if not getattr(turn, "should_retire", False):
         # Persist the SDK session id for restart/eviction/interrupt resume.
