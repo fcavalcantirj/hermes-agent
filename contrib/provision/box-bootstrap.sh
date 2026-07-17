@@ -113,7 +113,7 @@ rm -f /tmp/hermes.env
 
 # ── 5. toolkit + skills ──────────────────────────────────────────────
 say "dasbrow toolkit + skills"
-for f in delegate_coder.py golden_guard.py merge_branch.py; do
+for f in delegate_coder.py golden_guard.py merge_branch.py GOLDEN-RULES.md; do
   install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$CONTRIB/dasbrow-toolkit/$f" "$HOMEDIR/.dasbrowcoder/$f"
 done
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/merge-policy.json" "$HOMEDIR/.dasbrowcoder/merge-policy.json"

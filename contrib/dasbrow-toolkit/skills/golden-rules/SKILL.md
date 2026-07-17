@@ -5,7 +5,7 @@ description: Felipe's GOLDEN RULES — the engineering contract governing every 
 
 # Golden rules (advisory layer)
 
-Read `/home/browbot/.dasbrowcoder/GOLDEN-RULES.md` (deployed verbatim from git) and
+Read `~/.dasbrowcoder/GOLDEN-RULES.md` (deployed verbatim from git) and
 follow it literally. Highlights you must never violate:
 
 - Verify before you declare: label every claim [REAL] / [TEST] / [UNVERIFIED].
