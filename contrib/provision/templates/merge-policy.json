@@ -1,0 +1,3 @@
+{
+  "_comment": "Fail-closed merge policy: a repo absent from this map cannot be merged at all. Starts EMPTY on a fresh box — add repo->targets entries only on the owner's word; deployed beside merge_branch.py (no --policy override exists, deliberately)."
+}
