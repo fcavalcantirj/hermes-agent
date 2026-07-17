@@ -163,7 +163,9 @@ say "claude CLI (native, best-effort)"
 as_user "command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash" \
   || echo "WARN: claude CLI install failed (not required — SDK bundles its own)"
 say "go tools for the guard (best-effort, slow)"
-as_user "export PATH=\$PATH:/usr/local/go/bin:\$HOME/go/bin && \
+# cd ~ first — runuser inherits the script's cwd (/root/stack), unreadable to
+# the box user, and go's toolchain refuses an unreadable cwd (proven on run 2)
+as_user "cd ~ && export PATH=\$PATH:/usr/local/go/bin:\$HOME/go/bin && \
   go install golang.org/x/tools/gopls@latest && \
   go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest && \
   go install golang.org/x/vuln/cmd/govulncheck@latest" \
