@@ -70,11 +70,13 @@ as_user "mkdir -p ~/.hermes && cd ~/.hermes && \
   cd hermes-agent && git fetch -q origin && git checkout -q '$STACK_BRANCH' && \
   git pull -q --ff-only origin '$STACK_BRANCH' || true"
 as_user "cd ~/.hermes/hermes-agent && { [ -d venv ] || python3 -m venv venv; } && \
-  venv/bin/pip install -q -e '.[claude-agent-sdk]'"
+  venv/bin/pip install -q -e '.[claude-agent-sdk]' pytest"
 as_user "cd ~/.hermes/hermes-agent && { [ ! -f package.json ] || npm install --omit=dev --silent; }"
 
 say "fork smoke suites (claude_sdk_runtime + providers)"
-as_user "cd ~/.hermes/hermes-agent && venv/bin/python -m pytest \
+# inner shell needs its own pipefail — bash -lc does NOT inherit ours, and
+# without it `| tail -1` eats a failing suite (fail-open, proven on first run)
+as_user "set -o pipefail; cd ~/.hermes/hermes-agent && venv/bin/python -m pytest \
   tests/agent/test_claude_sdk_runtime.py tests/providers/ -q 2>&1 | tail -1"
 
 # ── 4. identity + config from templates ──────────────────────────────
@@ -117,19 +119,21 @@ done
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/merge-policy.json" "$HOMEDIR/.dasbrowcoder/merge-policy.json"
 as_user "mkdir -p ~/.dasbrowcoder/agents"
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$CONTRIB"/dasbrow-toolkit/agents/*.md "$HOMEDIR/.dasbrowcoder/agents/"
-# skills live in BOTH places (brain loads ~/.claude/skills — proven gotcha)
-as_user "rsync -a '$CONTRIB/dasbrow-toolkit/skills/' ~/.claude/skills/ && \
-         rsync -a '$CONTRIB/dasbrow-toolkit/skills/' ~/.dasbrowcoder/skills/"
+# skills live in BOTH places (brain loads ~/.claude/skills — proven gotcha).
+# Copy from the USER'S OWN clone (same branch) — /root/stack is unreadable to
+# the box user (proven on first run: rsync exit 23, Permission denied).
+as_user "rsync -a ~/.hermes/hermes-agent/contrib/dasbrow-toolkit/skills/ ~/.claude/skills/ && \
+         rsync -a ~/.hermes/hermes-agent/contrib/dasbrow-toolkit/skills/ ~/.dasbrowcoder/skills/"
 
 # ── 6. zvec-memory sidecar ───────────────────────────────────────────
 say "zvec-memory sidecar"
-as_user "rsync -a --exclude __pycache__ --exclude .pytest_cache '$CONTRIB/zvec-memory/' ~/zvec-memory/"
+as_user "rsync -a --exclude __pycache__ --exclude .pytest_cache ~/.hermes/hermes-agent/contrib/zvec-memory/ ~/zvec-memory/"
 as_user "cd ~/zvec-memory && { [ -d venv ] || python3 -m venv venv; } && \
   venv/bin/pip install -q zvec fastembed mcp pytest"
 say "zvec test suite on this box"
-as_user "cd ~/zvec-memory && venv/bin/python -m pytest tests/ -q 2>&1 | tail -1"
+as_user "set -o pipefail; cd ~/zvec-memory && venv/bin/python -m pytest tests/ -q 2>&1 | tail -1"
 say "warm local embedder (downloads bge-small once)"
-as_user "cd ~/zvec-memory && venv/bin/python -c 'import zvec_memory_core as c; print(\"warm:\", len(c.embed_local([\"warmup\"])[0]))' 2>&1 | tail -1"
+as_user "set -o pipefail; cd ~/zvec-memory && venv/bin/python -c 'import zvec_memory_core as c; print(\"warm:\", len(c.embed_local([\"warmup\"])[0]))' 2>&1 | tail -1"
 as_user "mkdir -p ~/.hermes/zvec-memory"
 if [ -n "${JINA_API_KEY:-}" ]; then
   printf '%s' "$JINA_API_KEY" > /tmp/jina.key
