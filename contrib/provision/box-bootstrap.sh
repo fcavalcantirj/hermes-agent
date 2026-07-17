@@ -41,7 +41,7 @@ timedatectl set-timezone "$TZ" || true
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git python3 python3-venv python3-pip curl ca-certificates \
-  build-essential nodejs npm jq rsync >/dev/null
+  build-essential nodejs npm jq rsync ripgrep gh tmux unzip htop >/dev/null
 
 ARCH=$(dpkg --print-architecture)   # arm64 | amd64
 if ! command -v /usr/local/go/bin/go >/dev/null 2>&1; then
@@ -54,6 +54,8 @@ ln -sf /usr/local/go/bin/go /usr/local/bin/go
 say "user $BOX_USER + linger"
 id "$BOX_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$BOX_USER"
 loginctl enable-linger "$BOX_USER"
+runuser -u "$BOX_USER" -- bash -c \
+  "git config --global user.name '$OWNER_NAME' && git config --global init.defaultBranch main" || true
 BOX_UID=$(id -u "$BOX_USER")
 RUNDIR="/run/user/$BOX_UID"
 # user manager needs a moment after enable-linger on first boot
