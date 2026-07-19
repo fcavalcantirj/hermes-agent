@@ -50,3 +50,82 @@ def test_fts_probe_error_classifier():
     assert _fts_object_missing(sqlite3.OperationalError("no such module: fts5"))
     assert not _fts_object_missing(sqlite3.OperationalError("database is locked"))
     assert not _fts_object_missing(sqlite3.OperationalError("disk I/O error"))
+
+
+def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
+    """Open a read-only SessionDB whose TRIGRAM probe raises `message`.
+
+    The seed DB is created first with a normal write handle (schema load),
+    THEN sqlite3.connect is wrapped so only the trigram probe statement
+    errors — the messages_fts probe and everything else run for real.
+    """
+    import sqlite3
+
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+
+    real_connect = sqlite3.connect
+
+    class _ProbeErrorConn:
+        def __init__(self, real):
+            self.__dict__["_real"] = real
+
+        def execute(self, sql, *args, **kwargs):
+            if "messages_fts_trigram" in sql:
+                raise sqlite3.OperationalError(message)
+            return self.__dict__["_real"].execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.__dict__["_real"], name)
+
+        def __setattr__(self, name, value):
+            setattr(self.__dict__["_real"], name, value)
+
+    monkeypatch.setattr(
+        hermes_state.sqlite3,
+        "connect",
+        lambda *args, **kwargs: _ProbeErrorConn(real_connect(*args, **kwargs)),
+    )
+    return SessionDB(db_path=db_path, read_only=True)
+
+
+def test_trigram_probe_transient_error_surfaces_and_closes(tmp_path, monkeypatch):
+    # Transient probe failures (lock during a checkpoint) SURFACE at open —
+    # upstream's _fts_table_probe re-raises anything that isn't a missing
+    # module/table, and the RO-open path closes the tracked connection on the
+    # way out so _backup_db_file's raw-copy is never blocked by a leaked
+    # handle. (Earlier revisions of this branch kept the handle open with
+    # trigram latched True; upstream's raise-with-cleanup supersedes that.)
+    import pytest
+    import sqlite3
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _read_only_db_with_trigram_probe_error(
+            tmp_path, monkeypatch, "database is locked"
+        )
+
+
+def test_trigram_probe_missing_table_disables_trigram(tmp_path, monkeypatch):
+    db = _read_only_db_with_trigram_probe_error(
+        tmp_path, monkeypatch, "no such table: messages_fts_trigram"
+    )
+    try:
+        assert db._trigram_available is False
+    finally:
+        db.close()
+
+
+def test_trigram_probe_missing_tokenizer_disables_trigram(tmp_path, monkeypatch):
+    # A build with FTS5 but without the trigram tokenizer (SQLite < 3.34)
+    # raises "no such tokenizer: trigram" — persistent absence, same latch as
+    # a missing table. _fts_object_missing alone does NOT classify this one;
+    # the probe must also consult _is_trigram_unavailable_error.
+    db = _read_only_db_with_trigram_probe_error(
+        tmp_path, monkeypatch, "no such tokenizer: trigram"
+    )
+    try:
+        assert db._trigram_available is False
+    finally:
+        db.close()
