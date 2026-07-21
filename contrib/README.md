@@ -1,5 +1,11 @@
 # contrib/ — the DasBrow stack (fork-only distribution layer)
 
+> **⚠ SUPERSEDED (2026-07-21).** This branch is frozen. The DasBrow stack —
+> engine snapshot, toolkit, zvec-memory, provision kit — moved to a private
+> repo (`dasbrow-hermes-coder`). This `contrib/` tree is no longer updated,
+> and the engine code on this branch predates the July-2026 review fixes.
+> Kept for provenance and for boxes provisioned before the move.
+
 This directory exists ONLY on the `dasbrow/stack` branch — never on
 `feat/claude-agent-sdk-provider` (the upstream-facing branch the public PRs are
 cut from) and never in upstream PRs. It packages everything a production box
