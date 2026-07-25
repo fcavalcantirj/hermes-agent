@@ -6,7 +6,8 @@ standard OpenAI-shaped ``{role, content, tool_calls, tool_call_id}`` entries
 that ``agent/curator.py`` already knows how to read. The structural twin of
 ``codex_event_projector.py`` — same contract, different wire shape.
 
-The SDK stream (``ClaudeSDKClient.receive_response()``) yields, per turn:
+The SDK stream (a persistent reader owning ``ClaudeSDKClient.receive_messages()``,
+with each turn fed its messages via an inbox) yields, per turn:
   - AssistantMessage   → content blocks: TextBlock / ThinkingBlock / ToolUseBlock
   - UserMessage        → tool results echoed back: ToolResultBlock entries
   - SystemMessage      → lifecycle events (init, …) — not conversation content
