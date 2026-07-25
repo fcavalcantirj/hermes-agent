@@ -196,6 +196,16 @@ def _build_hermes_tools_mcp_config(
     }
 
 
+class _StreamEnd:
+    """Reader-loop sentinel: the SDK message stream ended (CLI exited or the
+    transport tore down). Routed to the in-flight turn so it fails fast and
+    retires cleanly instead of waiting out its full turn_timeout on a dead
+    stream."""
+
+    def __init__(self, error: Optional[str] = None) -> None:
+        self.error = error
+
+
 class ClaudeAgentSdkSession:
     """One SDK client per Hermes session, lifetime owned by AIAgent.
 
@@ -252,6 +262,13 @@ class ClaudeAgentSdkSession:
         self._session_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._closed = False
+        # Stream ownership (see _reader_loop). The reader task is the ONLY
+        # consumer of the SDK stream; `_turn_inbox` is non-None exactly while a
+        # turn is in flight, which is what makes "unsolicited" decidable.
+        self._reader_task: Any = None
+        self._turn_inbox: Any = None
+        self._unsolicited_results = 0
+        self._stream_ended: Optional[_StreamEnd] = None
 
     # ---------- lifecycle ----------
 
@@ -285,6 +302,10 @@ class ClaudeAgentSdkSession:
         # — a None _client would skip disconnect and orphan it.
         self._client = client
         self._run_coro(client.connect(), timeout=60.0)
+        # From here on exactly ONE consumer owns the SDK stream (_reader_loop).
+        # Started after connect so the client is live, before any turn so no
+        # message can arrive unowned.
+        self._start_reader()
         logger.info(
             "claude-agent-sdk session started: model=%s mode=%s cwd=%s",
             self._model or "cli-default",
@@ -297,6 +318,9 @@ class ClaudeAgentSdkSession:
         if self._closed:
             return
         self._closed = True
+        # Cancel the reader BEFORE disconnect so it unwinds on a live stream
+        # instead of raising against a torn-down one.
+        self._stop_reader()
         if self._client is not None and self._loop is not None:
             try:
                 self._run_coro(self._client.disconnect(), timeout=10.0)
@@ -395,7 +419,12 @@ class ClaudeAgentSdkSession:
     # ---------- internals ----------
 
     async def _consume_turn(self, text: str) -> dict[str, Any]:
-        """The async side of one turn: query + drain receive_response()."""
+        """The async side of one turn: query, then read THIS turn's messages
+        off the reader loop's inbox until the ResultMessage.
+
+        Deliberately NOT `receive_response()` — that helper serves the oldest
+        buffered ResultMessage, which is not necessarily ours. See
+        `_reader_loop` for why that is a permanent-corruption bug."""
         projector = ClaudeSdkEventProjector()
         out: dict[str, Any] = {
             "final_text": "",
@@ -405,47 +434,176 @@ class ClaudeAgentSdkSession:
             "error": None,
             "result_uuid": None,
         }
-        await self._client.query(text)
-        async for message in self._client.receive_response():
-            # Capture the SDK session id from ANY message that carries it —
-            # the init SystemMessage announces it first, so even a turn
-            # interrupted before its ResultMessage keeps a resumable id.
-            early_sid = getattr(message, "session_id", None)
-            if early_sid:
-                self._session_id = early_sid
-            if self._interrupt_event.is_set():
-                break
-            if type(message).__name__ == "StreamEvent":
-                self._forward_stream_delta(message)
-                continue
-            self._notify_tool_started(message)
-            projection = projector.project(message)
-            if projection.messages:
-                out["messages"].extend(projection.messages)
-            if projection.is_tool_iteration:
-                out["tool_iterations"] += 1
-            if projection.final_text is not None:
-                out["final_text"] = projection.final_text
-            if projection.is_result:
-                usage = getattr(message, "usage", None)
-                if isinstance(usage, dict):
-                    out["usage"] = dict(usage)
-                sid = getattr(message, "session_id", None)
-                if sid:
-                    self._session_id = sid
-                out["result_uuid"] = getattr(message, "uuid", None)
-                subtype = getattr(message, "subtype", "") or ""
-                if getattr(message, "is_error", False):
-                    errors = getattr(message, "errors", None) or []
+        ended = self._stream_ended
+        if ended is not None:
+            out["error"] = "SDK message stream ended before this turn" + (
+                f": {ended.error}" if ended.error else ""
+            )
+            return out
+        inbox: Any = asyncio.Queue()
+        # Claim the stream BEFORE query() — a fast first message must not land
+        # while no turn is claimed and get routed away as unsolicited.
+        self._turn_inbox = inbox
+        interrupted = False
+        try:
+            await self._client.query(text)
+            while True:
+                message = await inbox.get()
+                if isinstance(message, _StreamEnd):
                     out["error"] = (
-                        f"SDK result error (subtype={subtype}): "
-                        + ("; ".join(str(e) for e in errors) or subtype)
+                        "SDK message stream ended before this turn's result"
+                        + (f": {message.error}" if message.error else "")
                     )
-                elif subtype not in ("", "success"):
-                    # e.g. error_max_turns / error_max_budget_usd — surface
-                    # honestly; the partial transcript is still projected.
-                    out["error"] = f"SDK turn ended: {subtype}"
+                    break
+                # Capture the SDK session id from ANY message that carries it —
+                # the init SystemMessage announces it first, so even a turn
+                # interrupted before its ResultMessage keeps a resumable id.
+                early_sid = getattr(message, "session_id", None)
+                if early_sid:
+                    self._session_id = early_sid
+                if self._interrupt_event.is_set():
+                    # Previously `break`. Bailing out before this turn's
+                    # ResultMessage orphaned it in the shared stream, and the
+                    # NEXT turn was then served that stale result — the same
+                    # off-by-one corruption `_reader_loop` exists to prevent,
+                    # reachable through the interrupt path with no Agent tool
+                    # involved. Keep draining to the result; stop projecting.
+                    interrupted = True
+                if type(message).__name__ == "StreamEvent":
+                    if not interrupted:
+                        self._forward_stream_delta(message)
+                    continue
+                if not interrupted:
+                    self._notify_tool_started(message)
+                projection = projector.project(message)
+                if not interrupted:
+                    if projection.messages:
+                        out["messages"].extend(projection.messages)
+                    if projection.is_tool_iteration:
+                        out["tool_iterations"] += 1
+                    if projection.final_text is not None:
+                        out["final_text"] = projection.final_text
+                if projection.is_result:
+                    usage = getattr(message, "usage", None)
+                    if isinstance(usage, dict):
+                        out["usage"] = dict(usage)
+                    sid = getattr(message, "session_id", None)
+                    if sid:
+                        self._session_id = sid
+                    out["result_uuid"] = getattr(message, "uuid", None)
+                    subtype = getattr(message, "subtype", "") or ""
+                    if getattr(message, "is_error", False):
+                        errors = getattr(message, "errors", None) or []
+                        out["error"] = (
+                            f"SDK result error (subtype={subtype}): "
+                            + ("; ".join(str(e) for e in errors) or subtype)
+                        )
+                    elif subtype not in ("", "success"):
+                        # e.g. error_max_turns / error_max_budget_usd — surface
+                        # honestly; the partial transcript is still projected.
+                        out["error"] = f"SDK turn ended: {subtype}"
+                    break
+        finally:
+            self._turn_inbox = None
+            # Anything the reader parked after our ResultMessage belongs to a
+            # CLI-initiated turn that overlapped ours. Route it now — left in
+            # a discarded queue it would be lost, and left in the stream it
+            # would become the next turn's answer.
+            while not inbox.empty():
+                self._handle_unsolicited(inbox.get_nowait())
         return out
+
+    # ---------- stream ownership ----------
+
+    async def _reader_loop(self) -> None:
+        """Sole owner of the SDK message stream for the client's lifetime.
+
+        Hermes used to call `receive_response()` once per turn. That helper
+        returns the OLDEST buffered ResultMessage — not necessarily this
+        turn's — and the SDK offers no per-turn correlator (`query()` takes
+        only a `session_id`, which is constant across turns; `ResultMessage`
+        has a `uuid` with no request-side counterpart). Ordering is therefore
+        the ONLY thing keeping answers matched to questions.
+
+        The Claude Code CLI breaks that ordering by itself: when a background
+        Agent task completes it injects a `<task-notification>` and runs a
+        FULL assistant turn nobody asked for, leaving an unconsumed
+        ResultMessage in the shared FIFO. Every later turn then pops a stale
+        result. Because a desynced turn still looks like success — no error,
+        no timeout, no interrupt — no retire path fires, so the skew is
+        permanent and silent. Observed live 2026-07-25: four such turns left a
+        constant off-by-4 for hours (dasbrow-hermes-coder#2).
+
+        One reader for the whole client lifetime makes the rule enforceable:
+        a message arriving while no turn is in flight is unsolicited BY
+        DEFINITION, and gets routed away instead of poisoning the next turn."""
+        end: _StreamEnd
+        try:
+            async for message in self._client.receive_messages():
+                inbox = self._turn_inbox
+                if inbox is not None:
+                    inbox.put_nowait(message)
+                else:
+                    self._handle_unsolicited(message)
+        except asyncio.CancelledError:  # pragma: no cover - shutdown path
+            raise
+        except Exception as exc:  # pragma: no cover - stream torn down
+            logger.debug("claude-agent-sdk reader loop ended", exc_info=True)
+            end = _StreamEnd(error=repr(exc))
+        else:
+            end = _StreamEnd(error=None)
+        # The stream is gone (CLI exited or transport died). Mark it for any
+        # future turn and wake the in-flight one, so nobody waits out a full
+        # turn_timeout against a dead stream.
+        self._stream_ended = end
+        inbox = self._turn_inbox
+        if inbox is not None:
+            inbox.put_nowait(end)
+
+    def _handle_unsolicited(self, message: Any) -> None:
+        """Route a message that arrived with no turn in flight.
+
+        These are real CLI output (typically a finished background Agent task
+        reporting in), but they answer nothing Hermes asked, so they must
+        never enter a turn's result."""
+        if isinstance(message, _StreamEnd):
+            return
+        sid = getattr(message, "session_id", None)
+        if sid:
+            self._session_id = sid
+        if type(message).__name__ == "ResultMessage":
+            self._unsolicited_results += 1
+            logger.warning(
+                "claude-agent-sdk: dropped unsolicited ResultMessage (no turn "
+                "in flight, total=%d) — CLI-initiated turn; see "
+                "dasbrow-hermes-coder#2",
+                self._unsolicited_results,
+            )
+        else:
+            logger.debug(
+                "claude-agent-sdk: unsolicited %s outside a turn",
+                type(message).__name__,
+            )
+
+    def _start_reader(self) -> None:
+        """Spawn the reader on the session loop. Idempotent."""
+        if self._reader_task is not None:
+            return
+
+        async def _spawn() -> Any:
+            return asyncio.ensure_future(self._reader_loop())
+
+        self._reader_task = self._run_coro(_spawn(), timeout=10.0)
+
+    def _stop_reader(self) -> None:
+        task = self._reader_task
+        self._reader_task = None
+        if task is None or self._loop is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(task.cancel)
+        except Exception:  # pragma: no cover - loop already gone
+            pass
 
     def _forward_stream_delta(self, message: Any) -> None:
         """Relay a top-level text delta to the display callback (never the

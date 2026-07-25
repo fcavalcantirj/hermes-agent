@@ -10,6 +10,9 @@ produce the re-auth hint), and the session's error path is asserted to
 retire the client rather than silently continue.
 """
 
+import asyncio
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -256,16 +259,41 @@ class TestAuthClassifier:
 # ---------- session (fake client) ----------
 
 
+_EOS = object()  # the fake CLI process exited: the message stream ends here
+
+
 class _FakeClient:
-    """Stub ClaudeSDKClient: async surface, scripted message stream."""
+    """Stub ClaudeSDKClient: async surface over ONE continuous message stream.
+
+    Mirrors the real SDK shape the session depends on:
+
+    - ``receive_messages()`` is the single continuous stream for the client's
+      lifetime (what the session's persistent reader owns);
+    - ``receive_response()`` is the SDK's drain-until-ResultMessage wrapper
+      over that same stream — kept so the PRE-fix session code also runs
+      against this fake, which is what makes the desync regression tests
+      below RED-provable on the buggy implementation;
+    - ``query()`` makes the scripted turn output appear on the stream, the
+      way the CLI answers a stdin message. A script with NO ResultMessage
+      models a CLI that died mid-turn: the stream ends right after it.
+    - ``feed(*messages)`` injects CLI-initiated output with no query — a
+      finished background Agent task reporting in. That is the trigger shape
+      of the 2026-07-25 stale-answer incident (dasbrow-hermes-coder#2).
+    """
 
     def __init__(self, options=None, script=None, connect_exc=None):
         self.options = options
-        self._script = script or []
+        self._script = list(script or [])
         self._connect_exc = connect_exc
         self.queried: list[str] = []
         self.disconnected = False
         self.interrupted = False
+        self._pending: deque = deque()
+
+    def feed(self, *messages):
+        """Thread-safe injection of unsolicited CLI output (deque append is
+        GIL-atomic; the consumer polls on the session loop)."""
+        self._pending.extend(messages)
 
     async def connect(self):
         if self._connect_exc is not None:
@@ -273,10 +301,26 @@ class _FakeClient:
 
     async def query(self, text):
         self.queried.append(text)
+        self._pending.extend(self._script)
+        if not any(type(m).__name__ == "ResultMessage" for m in self._script):
+            self._pending.append(_EOS)
+
+    async def receive_messages(self):
+        while True:
+            try:
+                message = self._pending.popleft()
+            except IndexError:
+                await asyncio.sleep(0.005)
+                continue
+            if message is _EOS:
+                return
+            yield message
 
     async def receive_response(self):
-        for message in self._script:
+        async for message in self.receive_messages():
             yield message
+            if type(message).__name__ == "ResultMessage":
+                return
 
     async def interrupt(self):
         self.interrupted = True
@@ -619,11 +663,16 @@ class TestMcpEnvMinimal:
         holder = {}
 
         class MidStreamClient(_FakeClient):
-            async def receive_response(self):
-                yield AssistantMessage(content=[TextBlock("first chunk")])
+            async def query(self, text):
+                self.queried.append(text)
+                self._pending.append(
+                    AssistantMessage(content=[TextBlock("first chunk")])
+                )
                 holder["session"]._interrupt_event.set()
-                yield AssistantMessage(content=[TextBlock("tail that must be discarded")])
-                yield ResultMessage(result="tail that must be discarded")
+                self._pending.append(
+                    AssistantMessage(content=[TextBlock("tail that must be discarded")])
+                )
+                self._pending.append(ResultMessage(result="tail that must be discarded"))
 
         def factory(options=None):
             client = MidStreamClient(options=options)
@@ -638,6 +687,134 @@ class TestMcpEnvMinimal:
             session.close()
         assert turn.interrupted is True
         assert all("discarded" not in str(m.get("content")) for m in turn.projected_messages)
+
+
+class TestStreamOwnership:
+    """Regression tests for the 2026-07-25 stale-answer incident
+    (dasbrow-hermes-coder#2): the Claude Code CLI runs FULL unsolicited turns
+    when background Agent tasks complete, leaving unconsumed ResultMessages in
+    the shared FIFO. ``receive_response()`` then serves the OLDEST buffered
+    result to the next turn — a permanent, silent off-by-N. Every test here is
+    RED on the pre-fix implementation."""
+
+    def _wait_unsolicited(self, session, n, timeout=5.0):
+        """Sync point for the fixed code (reader routes idle-time messages
+        within ms); a bounded no-op on the pre-fix code, which has no reader."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if getattr(session, "_unsolicited_results", 0) >= n:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_unsolicited_result_while_idle_is_not_served_as_next_answer(self):
+        session, holder = _make_session(
+            script=[
+                AssistantMessage(content=[TextBlock("fresh answer")]),
+                ResultMessage(result="fresh answer", uuid="fresh-1"),
+            ]
+        )
+        try:
+            session.ensure_started()
+            # A background Agent task finished while nobody asked anything:
+            # the CLI ran a full turn on its own initiative.
+            holder["client"].feed(
+                AssistantMessage(
+                    content=[TextBlock("stale answer to an earlier question")]
+                ),
+                ResultMessage(
+                    result="stale answer to an earlier question", uuid="stale-1"
+                ),
+            )
+            self._wait_unsolicited(session, 1)
+            turn = session.run_turn("new question", turn_timeout=15.0)
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "fresh answer"
+        assert getattr(session, "_unsolicited_results", None) == 1
+
+    def test_offset_does_not_accumulate_across_unsolicited_turns(self):
+        # The live incident: 4 unsolicited turns -> every later reply answered
+        # a question 4 back. N unsolicited results must be dropped, not queued.
+        session, holder = _make_session(
+            script=[
+                AssistantMessage(content=[TextBlock("the real answer")]),
+                ResultMessage(result="the real answer", uuid="real-1"),
+            ]
+        )
+        try:
+            session.ensure_started()
+            for i in range(3):
+                holder["client"].feed(
+                    AssistantMessage(content=[TextBlock(f"unsolicited {i}")]),
+                    ResultMessage(result=f"unsolicited {i}", uuid=f"u-{i}"),
+                )
+            self._wait_unsolicited(session, 3)
+            turn = session.run_turn("a question", turn_timeout=15.0)
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "the real answer"
+        assert getattr(session, "_unsolicited_results", None) == 3
+
+    def test_interrupted_turn_consumes_its_own_result(self):
+        # Second entry point to the same corruption: breaking out of the
+        # message loop on interrupt used to orphan that turn's ResultMessage
+        # in the stream, where it became the NEXT turn's answer.
+        holder = {}
+
+        class InterruptingClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                if len(self.queried) == 1:
+                    self._pending.append(
+                        AssistantMessage(content=[TextBlock("turn1 partial")])
+                    )
+                    holder["session"]._interrupt_event.set()
+                    self._pending.append(
+                        ResultMessage(result="turn1 stale result", uuid="r1")
+                    )
+                else:
+                    self._pending.append(
+                        AssistantMessage(content=[TextBlock("turn2 answer")])
+                    )
+                    self._pending.append(
+                        ResultMessage(result="turn2 answer", uuid="r2")
+                    )
+
+        def factory(options=None):
+            client = InterruptingClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        holder["session"] = session
+        try:
+            turn1 = session.run_turn("first", turn_timeout=15.0)
+            assert turn1.interrupted is True
+            turn2 = session.run_turn("second", turn_timeout=15.0)
+        finally:
+            session.close()
+        assert turn2.interrupted is False
+        assert turn2.final_text == "turn2 answer"  # NOT "turn1 stale result"
+
+    def test_stream_death_mid_turn_fails_fast_instead_of_hanging(self):
+        # A script with no ResultMessage models the CLI dying mid-turn. The
+        # turn must surface an error promptly — pre-fix the loop ended and the
+        # turn returned as an empty SUCCESS; an unguarded reader design would
+        # instead hang until turn_timeout.
+        session, _holder = _make_session(
+            script=[AssistantMessage(content=[TextBlock("half an answer")])]
+        )
+        started = time.monotonic()
+        try:
+            turn = session.run_turn("hi", turn_timeout=15.0)
+        finally:
+            session.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < 10.0, f"turn took {elapsed:.1f}s — hung on a dead stream"
+        assert turn.error is not None and "stream ended" in turn.error
 
 
 class TestHermesSessionIdPlumbing:
