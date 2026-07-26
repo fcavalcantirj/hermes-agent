@@ -806,6 +806,11 @@ agent:
   #   # permissions through Hermes' approval flow. Invalid values are ignored
   #   # with a warning.
   #   permission_mode: ""
+  #   # Per-query USD budget forwarded to the SDK's max_budget_usd option:
+  #   # the turn stops with error_max_budget_usd once exceeded. null
+  #   # (default) = no budget. Non-numeric / non-positive values are ignored
+  #   # with a warning.
+  #   max_budget_usd: null
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
