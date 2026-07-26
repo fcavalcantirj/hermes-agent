@@ -616,3 +616,44 @@ def test_select_cached_agent_history_prefers_longer_live_transcript():
     # No live transcript / not a list → no-op.
     assert _select_cached_agent_history(persisted, None) is persisted
     assert _select_cached_agent_history(persisted, "nope") is persisted
+
+
+def test_select_cached_agent_history_ignores_alternation_merge_shrink():
+    """The restored view merges split assistant tool-call pairs
+    (repair_message_sequence), so it runs SHORTER than the raw live list
+    without any write having been lost. Equal user turns = no lag: the
+    persisted view must win, or the #50502 guard false-fires on every
+    tool-use turn of a long session."""
+    from gateway.run import _select_cached_agent_history
+
+    live = [
+        {"role": "user", "content": "do the thing"},
+        {"role": "assistant", "content": "on it"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "done"},
+        {"role": "assistant", "content": "finished"},
+    ]
+    persisted = [
+        {"role": "user", "content": "do the thing"},
+        {"role": "assistant", "content": "on it", "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "done"},
+        {"role": "assistant", "content": "finished"},
+    ]
+    assert _select_cached_agent_history(persisted, live) is persisted
+
+
+def test_select_cached_agent_history_still_fires_on_lost_user_turn():
+    """A genuinely lost persisted turn (user row missing on disk) must still
+    trip the guard and prefer the live copy — the actual #50502 scenario."""
+    from gateway.run import _select_cached_agent_history
+
+    live = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    persisted = live[:2]
+    out = _select_cached_agent_history(persisted, live)
+    assert out == live
+    assert out is not live
