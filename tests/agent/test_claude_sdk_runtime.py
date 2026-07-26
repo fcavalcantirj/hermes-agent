@@ -434,6 +434,79 @@ class TestSession:
         fields = session.build_option_fields()
         assert "ANTHROPIC_API_KEY" not in fields["mcp_servers"]["hermes-tools"]["env"]
 
+    def test_metered_vectors_neutralized_in_cli_env(self, monkeypatch):
+        # The SDK spawns the claude CLI with the FULL parent env and merges
+        # options.env ON TOP ({**os.environ, **options.env}), so the scrub
+        # must override each present metered vector with "" — a filtered
+        # copy could never remove an inherited key. Simulate the SDK merge
+        # to prove the neutralization end-to-end.
+        import os as _os
+
+        metered = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-fake",
+            "ANTHROPIC_AUTH_TOKEN": "fake-bearer",
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "AWS_ACCESS_KEY_ID": "AKIAFAKE",
+            "AWS_SECRET_ACCESS_KEY": "fake-secret",
+            "AWS_SESSION_TOKEN": "fake-session",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/fake-sa.json",
+        }
+        for key, value in metered.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-subscription")
+
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        fields = session.build_option_fields()
+
+        # Every present metered vector is overridden to "" (empty = unset
+        # for the CLI and the AWS/GCP credential chains).
+        for key in metered:
+            assert fields["env"][key] == "", key
+
+        # The SDK-side merge — the actual child env — sees them neutralized.
+        merged = {**_os.environ, **fields["env"]}
+        for key in metered:
+            assert merged[key] == "", key
+
+        # Benign keys and the subscription token flow are NOT overridden:
+        # absent from options.env, so the inherited values survive the merge.
+        for benign in ("HOME", "PATH", "CLAUDE_CODE_OAUTH_TOKEN"):
+            assert benign not in fields["env"], benign
+        assert merged["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-subscription"
+
+    def test_absent_metered_vectors_are_not_invented(self, monkeypatch):
+        # Only PRESENT vectors are overridden — writing "" for absent ones
+        # would hand the child empty vars it never had (an empty
+        # AWS_ACCESS_KEY_ID can itself break AWS credential chains).
+        for key in (
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["env"] == {}
+
+    def test_allow_metered_key_disables_the_scrub(self, monkeypatch):
+        # allow_metered_key: true is the operator's explicit metered opt-in
+        # (the startup guard honors it); the scrub must honor it too, or the
+        # documented escape hatch would hand the CLI a blanked key.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"allow_metered_key": True}}
+            },
+            raising=False,
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["env"] == {}
+
     def test_metered_key_refuses_startup_fail_closed(self, monkeypatch):
         # The hard rule enforced at the front door: a present metered key
         # must abort the REAL runtime startup path, never silently rebill.

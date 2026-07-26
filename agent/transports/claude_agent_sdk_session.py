@@ -130,6 +130,49 @@ def _hermes_repo_root() -> str:
     )
 
 
+# The SDK spawns the Claude Code CLI with the FULL inherited parent env and
+# merges ``ClaudeAgentOptions.env`` ON TOP of it (subprocess_cli.py builds
+# ``{**os.environ, ..., **options.env, ...}``), so a key can never be REMOVED
+# from the options side — the only lever is an explicit override. Every
+# metered billing vector below is overridden to "" (the CLI and the AWS/GCP
+# SDKs treat an empty value as unset), so a credentialed gateway environment
+# cannot silently re-route this provider's billing off the Claude
+# subscription. Why each class of key is stripped:
+#
+#   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN — the CLI prefers these over
+#     subscription OAuth: the exact silent-rebilling the fail-closed startup
+#     guard exists to stop. The guard covers Hermes' own process at startup;
+#     this scrub covers the spawned CLI, which otherwise inherits them.
+#   CLAUDE_CODE_USE_BEDROCK + AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+#     AWS_SESSION_TOKEN — flips the CLI onto AWS Bedrock, billing the AWS
+#     account (metered) instead of the subscription; the AWS static
+#     credentials are the vector that makes the flip actually authenticate.
+#   CLAUDE_CODE_USE_VERTEX + GOOGLE_APPLICATION_CREDENTIALS — the same
+#     takeover via Google Vertex, billing the GCP project.
+#
+# Deliberately NOT stripped: HOME/PATH (the CLI needs them to run and to find
+# its credential store) and the subscription token flow itself —
+# CLAUDE_CODE_OAUTH_TOKEN / ~/.claude — which is what this provider runs on.
+_METERED_ENV_DENYLIST = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+)
+
+
+def _scrubbed_sdk_env() -> dict[str, str]:
+    """Empty-string overrides for every metered billing vector currently set
+    in the parent environment. Only PRESENT keys are overridden — writing
+    ``""`` for absent ones would introduce empty vars the child never had
+    (an empty AWS_ACCESS_KEY_ID can itself confuse AWS credential chains)."""
+    return {key: "" for key in _METERED_ENV_DENYLIST if os.environ.get(key)}
+
+
 # The SDK serializes the stdio MCP config — env INCLUDED — into the claude
 # CLI's --mcp-config argument, i.e. onto the subprocess argv, which any local
 # user can read via ps. Nothing secret may ever ride this dict: the env is a
@@ -682,6 +725,15 @@ class ClaudeAgentSdkSession:
         ):
             can_use_tool = self._make_can_use_tool()
 
+        # Metered-vector scrub for the spawned CLI (see _METERED_ENV_DENYLIST).
+        # agent.claude_agent_sdk.allow_metered_key: true is the operator's
+        # explicit "bill me metered" opt-in (the same flag the startup guard
+        # honors), so it disables the scrub too — otherwise the documented
+        # escape hatch would hand the CLI an environment with the key blanked.
+        env_overrides: dict[str, str] = {}
+        if not _provider_flag("allow_metered_key"):
+            env_overrides = _scrubbed_sdk_env()
+
         fields = {
             "model": self._model,
             "cwd": self._cwd,
@@ -690,6 +742,7 @@ class ClaudeAgentSdkSession:
             "mcp_servers": mcp_servers,
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
+            "env": env_overrides,
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
