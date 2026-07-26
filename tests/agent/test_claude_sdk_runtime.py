@@ -426,6 +426,57 @@ class TestSession:
         assert options["permission_mode"] in {
             "acceptEdits", "default", "bypassPermissions",
         }
+        # Explicit SDK isolation: None would load ALL of ~/.claude and
+        # .claude/settings*, letting ambient settings shadow the gateway's
+        # approval posture. The empty list is the SDK's isolation mode.
+        assert options["setting_sources"] == []
+
+    def test_config_permission_mode_overrides_env_mapping(self, monkeypatch):
+        # agent.claude_agent_sdk.permission_mode (an SDK literal) wins over
+        # the HERMES_TERMINAL_SECURITY_MODE mapping; explicit constructor
+        # arg still wins over both.
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "unrestricted")
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"permission_mode": "plan"}}
+            },
+            raising=False,
+        )
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["permission_mode"] == "plan"
+
+        explicit = ClaudeAgentSdkSession(
+            cwd="/tmp", permission_mode="default", client_factory=MagicMock()
+        )
+        assert explicit.build_option_fields()["permission_mode"] == "default"
+
+    def test_invalid_config_permission_mode_falls_back(self, monkeypatch):
+        # A typo must never silently change the posture — the env mapping
+        # stands (default env → acceptEdits).
+        import hermes_cli.config as cfg
+
+        monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"permission_mode": "yolo"}}
+            },
+            raising=False,
+        )
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["permission_mode"] == "acceptEdits"
+
+    def test_empty_config_permission_mode_keeps_env_mapping(self, monkeypatch):
+        # "" (the canonical default) = current behavior: the
+        # HERMES_TERMINAL_SECURITY_MODE mapping stands.
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["permission_mode"] == "default"
 
     def test_metered_key_scrubbed_from_mcp_env(self, monkeypatch):
         # RED-first: with the ambient var set, the builder must scrub it.

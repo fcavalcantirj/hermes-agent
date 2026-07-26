@@ -264,6 +264,16 @@ DEFAULT_CONFIG = {
             # Optional operator persona/soul file appended to the system prompt
             # ("" = none).
             "append_file": "",
+            # SDK permission mode, taken VERBATIM as a claude-agent-sdk
+            # permission_mode literal: default | acceptEdits | plan |
+            # bypassPermissions | dontAsk | auto (note: "auto" is the SDK's
+            # own mode, not the HERMES_TERMINAL_SECURITY_MODE value of the
+            # same name). "" (the default) keeps current behavior — the
+            # HERMES_TERMINAL_SECURITY_MODE mapping stands. Set
+            # "default" to route SDK tool permissions through Hermes'
+            # approval flow without env archaeology. Invalid values are
+            # ignored with a warning (never silently loosened).
+            "permission_mode": "",
         },
     },
 

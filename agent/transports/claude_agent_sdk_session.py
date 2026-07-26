@@ -39,19 +39,63 @@ from agent.transports.claude_sdk_event_projector import ClaudeSdkEventProjector
 logger = logging.getLogger(__name__)
 
 
-# HERMES_TERMINAL_SECURITY_MODE → SDK permission_mode. A deploy-side env
-# knob read at session construction (default "auto"), mirroring the codex
-# session's identical switch — no config key backs it in either runtime.
-# "auto" parity note: codex's default profile is workspace-write; the
-# closest SDK mode is acceptEdits (file edits auto-approved inside cwd).
-# Non-default modes route tool calls through can_use_tool / fail-closed —
-# reachable only when an operator exports the variable.
+# HERMES_TERMINAL_SECURITY_MODE → SDK permission_mode, read at session
+# construction (default "auto"). Precedence: explicit constructor arg, then
+# the agent.claude_agent_sdk.permission_mode config key (an SDK mode literal
+# — see _configured_permission_mode), then this env mapping.
+#
+# Posture, stated honestly: "auto" → acceptEdits is NOT codex parity, it is
+# merely the closest available mode. Codex's default workspace-write profile
+# still surfaces escalations for approval; acceptEdits auto-approves file
+# edits under cwd with NO Hermes approval callback in the loop — the
+# can_use_tool bridge is wired ONLY in "default" mode (see
+# build_option_fields), and bypassPermissions disables SDK permission
+# prompts entirely. Operators who want the gateway's approval flow set
+# HERMES_TERMINAL_SECURITY_MODE=approval-required or
+# agent.claude_agent_sdk.permission_mode: default in config.yaml.
 _HERMES_TO_SDK_PERMISSION_MODE = {
     "auto": "acceptEdits",
     "approval-required": "default",
     "unrestricted": "bypassPermissions",
     "yolo": "bypassPermissions",
 }
+
+# The SDK's own permission_mode literals (verified against the installed
+# claude-agent-sdk 0.2.120 ClaudeAgentOptions type).
+_SDK_PERMISSION_MODES = (
+    "default",
+    "acceptEdits",
+    "plan",
+    "bypassPermissions",
+    "dontAsk",
+    "auto",
+)
+
+
+def _configured_permission_mode() -> Optional[str]:
+    """agent.claude_agent_sdk.permission_mode from config.yaml, validated.
+
+    Takes an SDK permission_mode literal VERBATIM (one of
+    _SDK_PERMISSION_MODES — note "auto" here is the SDK's own mode, NOT the
+    HERMES_TERMINAL_SECURITY_MODE value of the same name). Empty/absent —
+    the default — keeps current behavior: the HERMES_TERMINAL_SECURITY_MODE
+    mapping stands, so existing deployments harden without env archaeology
+    only when they opt in. Unknown values are ignored with a warning:
+    permissions must never silently loosen (or tighten into an unusable
+    mode) on a typo."""
+    raw = str(_provider_config().get("permission_mode") or "").strip()
+    if not raw:
+        return None
+    if raw not in _SDK_PERMISSION_MODES:
+        logger.warning(
+            "agent.claude_agent_sdk.permission_mode=%r is not a valid SDK "
+            "permission mode (one of %s) — ignoring it; the "
+            "HERMES_TERMINAL_SECURITY_MODE mapping stands.",
+            raw,
+            ", ".join(_SDK_PERMISSION_MODES),
+        )
+        return None
+    return raw
 
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
@@ -287,6 +331,7 @@ class ClaudeAgentSdkSession:
         self._model = model
         self._permission_mode = (
             permission_mode
+            or _configured_permission_mode()
             or _HERMES_TO_SDK_PERMISSION_MODE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
                 "acceptEdits",
@@ -743,6 +788,17 @@ class ClaudeAgentSdkSession:
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
             "env": env_overrides,
+            # Explicit SDK isolation. None (the SDK default, verified against
+            # claude-agent-sdk 0.2.120) means the CLI loads ALL filesystem
+            # settings — ~/.claude/settings.json, .claude/settings.json,
+            # .claude/settings.local.json — so ambient operator/project
+            # settings could re-permission tools or install hooks UNDERNEATH
+            # the permission_mode/can_use_tool posture configured above. The
+            # empty list is the SDK's documented isolation mode: settings
+            # come from Hermes config only. Accepted side effect: "project"
+            # is also what loads CLAUDE.md, which this runtime doesn't want —
+            # it composes its own system-prompt append.
+            "setting_sources": [],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
