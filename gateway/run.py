@@ -1202,6 +1202,14 @@ def _build_gateway_agent_history(
     return agent_history, observed_context
 
 
+def _user_turn_count(history: List[Dict[str, Any]]) -> int:
+    """Count ``user`` turns — the loss-proof yardstick for the #50502 guard
+    (in-memory repairs merge only assistant/tool shapes)."""
+    return sum(
+        1 for m in history if isinstance(m, dict) and m.get("role") == "user"
+    )
+
+
 def _select_cached_agent_history(
     persisted_history: List[Dict[str, Any]],
     live_history: Any,
@@ -1226,20 +1234,15 @@ def _select_cached_agent_history(
     ``repair_message_sequence``), shrinking the disk-side count on every
     tool-use turn with zero data lost. User turns are never merged by any
     repair shape, so only a live user turn absent from the persisted view
-    marks genuine persistence loss.
+    marks genuine persistence loss. Assistant/tool-only loss with user-turn
+    parity intact is intentionally out of this guard's scope — raw length is
+    unusable under the repair, and user turns are the only merge-proof
+    yardstick.
     """
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
         if _user_turn_count(live_history) > _user_turn_count(persisted_history):
             return list(live_history)
     return persisted_history
-
-
-def _user_turn_count(history: List[Dict[str, Any]]) -> int:
-    """Count ``user`` turns — the loss-proof yardstick for the #50502 guard
-    (in-memory repairs merge only assistant/tool shapes)."""
-    return sum(
-        1 for m in history if isinstance(m, dict) and m.get("role") == "user"
-    )
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
