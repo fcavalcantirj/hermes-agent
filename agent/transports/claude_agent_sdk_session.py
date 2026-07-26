@@ -753,7 +753,7 @@ class ClaudeAgentSdkSession:
         # honors), so it disables the scrub too — otherwise the documented
         # escape hatch would hand the CLI an environment with the key blanked.
         env_overrides: dict[str, str] = {}
-        if not _provider_flag("allow_metered_key"):
+        if not _provider_flag("allow_metered_key", "HERMES_CLAUDE_SDK_ALLOW_API_KEY"):
             env_overrides = _scrubbed_sdk_env()
 
         fields = {
