@@ -20,13 +20,21 @@ class TestClaudeAgentSdkDefaults:
         assert "claude_agent_sdk" in agent
 
     def test_canonical_defaults(self):
-        # Upstream-conservative: no partial-message deltas, refuse to start
-        # over a metered key, no persona file appended.
-        assert DEFAULT_CONFIG["agent"]["claude_agent_sdk"] == {
-            "streaming": False,
-            "allow_metered_key": False,
-            "append_file": "",
-        }
+        # Upstream-conservative: every default is falsy/conservative. Pinned
+        # PER KEY (not whole-dict equality) so adding a new key to the block
+        # doesn't break unrelated pins — each key's relationship is the
+        # contract, not the dict's exact shape.
+        block = DEFAULT_CONFIG["agent"]["claude_agent_sdk"]
+        # No partial-message deltas unless the operator opts in.
+        assert block["streaming"] is False
+        # Refuse to start over a metered key unless explicitly allowed.
+        assert block["allow_metered_key"] is False
+        # No persona file appended by default.
+        assert block["append_file"] == ""
+        # Every default in the block must be falsy — a new key that defaults
+        # truthy is a behavior change and needs its own explicit pin here.
+        for key, value in block.items():
+            assert not value, f"default for {key!r} must be conservative/falsy"
 
 
 class TestUserConfigMerge:
@@ -51,11 +59,12 @@ class TestUserConfigMerge:
 
     def test_config_without_block_gets_defaults(self, tmp_path, monkeypatch):
         cfg = self._load(tmp_path, monkeypatch, {"agent": {"max_turns": 5}})
-        assert cfg["agent"]["claude_agent_sdk"] == {
-            "streaming": False,
-            "allow_metered_key": False,
-            "append_file": "",
-        }
+        # Per-key pins (not whole-dict equality) — see test_canonical_defaults.
+        block = cfg["agent"]["claude_agent_sdk"]
+        assert block["streaming"] is False
+        assert block["allow_metered_key"] is False
+        assert block["append_file"] == ""
+        assert set(block) == set(DEFAULT_CONFIG["agent"]["claude_agent_sdk"])
         # The user's own key survives beside the filled-in block.
         assert cfg["agent"]["max_turns"] == 5
 

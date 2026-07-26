@@ -1009,11 +1009,12 @@ class TestHermesSessionIdPlumbing:
             messages=[{"role": "user", "content": "hi"}],
             effective_task_id="task-1",
         )
-        assert captured == {
-            "platform": "telegram",
-            "session_id": "sess-1",
-            "model": "claude-opus-4-8",
-        }
+        # Per-key pins (not whole-dict equality): the contract is that the
+        # builder receives the live session's platform/session/model — a new
+        # kwarg added later must not break these unrelated assertions.
+        assert captured["platform"] == "telegram"
+        assert captured["session_id"] == "sess-1"
+        assert captured["model"] == "claude-opus-4-8"
 
 
 # ---------- interrupt routes to the SDK session (W4) ----------
