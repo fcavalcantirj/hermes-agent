@@ -1813,10 +1813,51 @@ class TestAuxLaneFailClosed:
 
 
 class TestSdkAvailabilityGate:
+    def test_check_routes_through_lazy_install_lane(self, monkeypatch):
+        # F1 (deps): the SDK is an opt-in extra excluded from [all], so the
+        # availability gate must offer the lazy-install lane first — the
+        # exact pattern anthropic_adapter._get_anthropic_sdk uses for
+        # provider.anthropic. A lean install otherwise dead-ends on
+        # ImportError with no self-serve path.
+        import tools.lazy_deps as lazy_deps
+        from agent.transports.claude_agent_sdk_session import (
+            check_claude_sdk_available,
+        )
+
+        assert "provider.claude_agent_sdk" in lazy_deps.LAZY_DEPS
+        called = {}
+
+        def fake_ensure(feature, *, prompt=True):
+            called["feature"] = feature
+            called["prompt"] = prompt
+
+        monkeypatch.setattr(lazy_deps, "ensure", fake_ensure)
+        check_claude_sdk_available()
+        assert called == {"feature": "provider.claude_agent_sdk", "prompt": False}
+
+    def test_lazy_lane_pin_matches_pyproject_extra(self):
+        # The LAZY_DEPS lane must mirror the pyproject extra in lockstep
+        # (same contract test_pyproject_and_lazy_deps_pins_agree enforces
+        # globally; pinned here so the SDK lane keeps a single exact spec).
+        from tools.lazy_deps import LAZY_DEPS
+
+        specs = LAZY_DEPS["provider.claude_agent_sdk"]
+        assert len(specs) == 1
+        assert specs[0].startswith("claude-agent-sdk==")
+
     def test_check_reports_missing_sdk(self, monkeypatch):
         # RED-first negative control: with the import broken, the gate must
-        # fail with the install hint — never silently pass.
+        # fail with the install hint — never silently pass. The lazy lane is
+        # stubbed to FeatureUnavailable (lazy installs disabled / offline) so
+        # the test never triggers a real multi-MB SDK download on CI.
         import builtins
+
+        import tools.lazy_deps as lazy_deps
+
+        def _unavailable(feature, *, prompt=True):
+            raise lazy_deps.FeatureUnavailable(feature, (), "disabled in test")
+
+        monkeypatch.setattr(lazy_deps, "ensure", _unavailable)
 
         real_import = builtins.__import__
 

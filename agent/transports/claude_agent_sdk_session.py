@@ -100,6 +100,18 @@ def classify_auth_failure(*parts: str) -> Optional[str]:
 def check_claude_sdk_available() -> tuple[bool, str]:
     """Preflight: the optional SDK extra must be importable, and it bundles /
     locates the Claude Code CLI itself. Mirrors check_codex_binary()."""
+    # Lazy-install lane, mirroring agent/anthropic_adapter._get_anthropic_sdk:
+    # the extra is opt-in (excluded from [all]), so first use on a lean
+    # install goes through tools.lazy_deps.ensure. FeatureUnavailable falls
+    # through to the ImportError message below — same fail shape either way.
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("provider.claude_agent_sdk", prompt=False)
+    except ImportError:
+        pass
+    except Exception:
+        # FeatureUnavailable — fall through to ImportError handling below
+        pass
     try:
         import claude_agent_sdk  # noqa: F401
     except ImportError:
