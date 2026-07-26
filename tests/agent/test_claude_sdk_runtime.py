@@ -799,6 +799,45 @@ class TestStreamOwnership:
         assert turn2.interrupted is False
         assert turn2.final_text == "turn2 answer"  # NOT "turn1 stale result"
 
+    def test_residue_after_result_is_not_carried_into_next_turn(self):
+        # A CLI turn that completes WHILE ours is running parks its result
+        # behind ours in the stream. It must be routed away as unsolicited,
+        # not served as the next turn's answer. (Mid-flight overlap — the one
+        # window the idle-time tests above don't cover. Ported from the
+        # independent re-derivation of this fix, commit 09537f965.)
+        holder = {}
+
+        class OverlappingClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                if len(self.queried) == 1:
+                    self._pending.append(ResultMessage(result="FIRST", uuid="f-1"))
+                    self._pending.append(
+                        ResultMessage(
+                            result="RESIDUE from an overlapping CLI turn",
+                            uuid="res-1",
+                        )
+                    )
+                else:
+                    self._pending.append(ResultMessage(result="SECOND", uuid="s-1"))
+
+        def factory(options=None):
+            client = OverlappingClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        try:
+            first = session.run_turn("one", turn_timeout=15.0)
+            assert first.final_text == "FIRST"
+            assert self._wait_unsolicited(session, 1), (
+                "residue was left in the stream to poison the next turn"
+            )
+            second = session.run_turn("two", turn_timeout=15.0)
+        finally:
+            session.close()
+        assert second.final_text == "SECOND"
+
     def test_stream_death_mid_turn_fails_fast_instead_of_hanging(self):
         # A script with no ResultMessage models the CLI dying mid-turn. The
         # turn must surface an error promptly — pre-fix the loop ended and the
