@@ -1067,6 +1067,61 @@ class TestHermesSessionIdPlumbing:
         assert captured["session_id"] == "sess-1"
         assert captured["model"] == "claude-opus-4-8"
 
+    @staticmethod
+    def _run_with_spy_session(monkeypatch, config_block):
+        """Drive one runtime turn with a kwargs-capturing session and the
+        given agent.claude_agent_sdk config block; returns captured kwargs."""
+        import agent.claude_sdk_runtime as rt
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": config_block}},
+            raising=False,
+        )
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+        monkeypatch.setattr(rt, "build_system_prompt_append", lambda **k: None)
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        return captured
+
+    def test_max_budget_usd_config_reaches_the_session(self, monkeypatch):
+        captured = self._run_with_spy_session(
+            monkeypatch, {"max_budget_usd": 2.5}
+        )
+        assert captured["max_budget_usd"] == 2.5
+
+    def test_max_budget_usd_default_is_no_budget(self, monkeypatch):
+        captured = self._run_with_spy_session(monkeypatch, {})
+        assert captured["max_budget_usd"] is None
+
+    def test_max_budget_usd_invalid_values_ignored(self, monkeypatch):
+        # A typo or a nonsense cap (0 would fail every turn instantly) must
+        # never become a silent behavior change — no budget is passed.
+        for bad in ("not-a-number", 0, -3, True):
+            captured = self._run_with_spy_session(
+                monkeypatch, {"max_budget_usd": bad}
+            )
+            assert captured["max_budget_usd"] is None, bad
+
 
 # ---------- interrupt routes to the SDK session (W4) ----------
 

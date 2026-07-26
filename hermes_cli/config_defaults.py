@@ -274,6 +274,12 @@ DEFAULT_CONFIG = {
             # approval flow without env archaeology. Invalid values are
             # ignored with a warning (never silently loosened).
             "permission_mode": "",
+            # Per-query USD budget forwarded to the SDK's max_budget_usd:
+            # the turn stops with error_max_budget_usd once exceeded
+            # (surfaced honestly in the reply). null (the default) = no
+            # budget. Non-numeric / non-positive values are ignored with a
+            # warning.
+            "max_budget_usd": None,
         },
     },
 

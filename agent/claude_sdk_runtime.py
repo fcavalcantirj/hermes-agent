@@ -440,6 +440,45 @@ def _render_continuity_digest(prior_messages: List[Dict[str, Any]]) -> str:
     )
 
 
+def _configured_max_budget_usd() -> Optional[float]:
+    """agent.claude_agent_sdk.max_budget_usd from config.yaml.
+
+    Forwarded to the SDK's ``max_budget_usd`` option: the query stops with an
+    ``error_max_budget_usd`` result once exceeded (which run_turn already
+    surfaces as "SDK turn ended: error_max_budget_usd"). None/absent — the
+    canonical default — means no budget, i.e. current behavior. Non-numeric
+    or non-positive values are ignored with a warning rather than passed
+    through: a 0 cap would fail every turn instantly, and a typo must never
+    become a silent behavior change."""
+    from agent.transports.claude_agent_sdk_session import _provider_config
+
+    raw = _provider_config().get("max_budget_usd")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):
+        # YAML `true` would float() to 1.0 — a nonsense budget, reject it.
+        logger.warning(
+            "agent.claude_agent_sdk.max_budget_usd=%r is not a number — "
+            "ignoring (no budget cap).", raw,
+        )
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.claude_agent_sdk.max_budget_usd=%r is not a number — "
+            "ignoring (no budget cap).", raw,
+        )
+        return None
+    if value <= 0:
+        logger.warning(
+            "agent.claude_agent_sdk.max_budget_usd=%r must be positive — "
+            "ignoring (no budget cap).", raw,
+        )
+        return None
+    return value
+
+
 def run_claude_agent_sdk_turn(
     agent,
     *,
@@ -509,6 +548,10 @@ def run_claude_agent_sdk_turn(
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
             on_stream_delta=_relay_stream_delta,
+            # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
+            # None = no budget. Read per session creation so a config edit
+            # applies on the next session, same as the append snapshot.
+            max_budget_usd=_configured_max_budget_usd(),
         )
         # The prologue persisted Hermes' native composed prompt — a prompt
         # this runtime never sends. Overwrite the snapshot with the

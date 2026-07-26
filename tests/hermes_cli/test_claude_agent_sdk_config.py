@@ -34,6 +34,8 @@ class TestClaudeAgentSdkDefaults:
         # "" = current behavior: the HERMES_TERMINAL_SECURITY_MODE mapping
         # stands; a non-empty value is an SDK permission_mode literal.
         assert block["permission_mode"] == ""
+        # null = no per-query budget cap (current behavior).
+        assert block["max_budget_usd"] is None
         # Every default in the block must be falsy — a new key that defaults
         # truthy is a behavior change and needs its own explicit pin here.
         for key, value in block.items():
