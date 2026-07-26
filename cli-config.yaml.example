@@ -806,6 +806,13 @@ agent:
   #   # permissions through Hermes' approval flow. Invalid values are ignored
   #   # with a warning.
   #   permission_mode: ""
+  #   # SDK setting sources (claude-agent-sdk SettingSource literals:
+  #   # user | project | local). [] (default) = full isolation: the spawned
+  #   # CLI loads no filesystem settings. Opt in (e.g. ["user"]) when your
+  #   # deployment keeps tool grants in the operator's ~/.claude/settings.json
+  #   # — unattended cron turns can't answer permission prompts. Invalid
+  #   # entries are dropped with a warning.
+  #   setting_sources: []
   #   # Per-query USD budget forwarded to the SDK's max_budget_usd option:
   #   # the turn stops with error_max_budget_usd once exceeded. null
   #   # (default) = no budget. Non-numeric / non-positive values are ignored
