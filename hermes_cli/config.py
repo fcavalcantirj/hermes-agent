@@ -1137,6 +1137,35 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Claude Agent SDK provider runtime (selected with
+        # `provider: claude-agent-sdk`). These are the canonical defaults for
+        # the `agent.claude_agent_sdk` block; the provider reads them through
+        # load_config_readonly(). config.yaml is the only interface for these —
+        # they are behavioural settings, not secrets.
+        "claude_agent_sdk": {
+            # Emit the SDK's partial-message deltas into the gateway streaming
+            # pipeline (the top-level `streaming:` block still governs how the
+            # deltas are displayed). Default off — upstream-conservative.
+            "streaming": False,
+            # The provider exists to bill the Claude subscription and refuses to
+            # start while a metered ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+            # could silently take over billing. Set true to allow that.
+            "allow_metered_key": False,
+            # Optional operator persona/soul file appended to the system prompt
+            # ("" = none).
+            "append_file": "",
+            # SDK permission mode, taken VERBATIM as a claude-agent-sdk
+            # permission_mode literal: default | acceptEdits | plan |
+            # bypassPermissions | dontAsk | auto (note: "auto" is the SDK's
+            # own mode, not the HERMES_TERMINAL_SECURITY_MODE value of the
+            # same name). "" (the default) keeps current behavior — the
+            # HERMES_TERMINAL_SECURITY_MODE mapping stands. Set
+            # "default" to route SDK tool permissions through Hermes'
+            # approval flow without env archaeology. Invalid values are
+            # ignored with a warning (never silently loosened).
+            "permission_mode": "",
+        },
     },
 
     "terminal": {
