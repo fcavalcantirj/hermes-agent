@@ -280,6 +280,15 @@ DEFAULT_CONFIG = {
             # budget. Non-numeric / non-positive values are ignored with a
             # warning.
             "max_budget_usd": None,
+            # SDK setting sources, taken as claude-agent-sdk SettingSource
+            # literals: user | project | local. [] (the default) is full
+            # isolation — the spawned CLI loads NO filesystem settings, so
+            # ambient ~/.claude or project files can't re-permission tools
+            # underneath the configured posture. Deployments that keep tool
+            # grants in the operator's ~/.claude/settings.json (unattended
+            # cron turns with nobody to answer a prompt) opt back in, e.g.
+            # ["user"]. Invalid entries are dropped with a warning.
+            "setting_sources": [],
         },
     },
 

@@ -97,6 +97,43 @@ def _configured_permission_mode() -> Optional[str]:
         return None
     return raw
 
+
+# The SDK's own setting-source literals (verified against the installed
+# claude-agent-sdk 0.2.120 SettingSource type).
+_SDK_SETTING_SOURCES = ("user", "project", "local")
+
+
+def _configured_setting_sources() -> list:
+    """agent.claude_agent_sdk.setting_sources from config.yaml, validated.
+
+    Default (absent/empty) is FULL ISOLATION — the SDK loads no filesystem
+    settings, so ambient ``~/.claude`` or project files cannot re-permission
+    tools or install hooks underneath the configured posture. Deployments
+    whose operating model deliberately stores tool grants in the operator's
+    own ``~/.claude/settings.json`` — an unattended box whose cron turns
+    must pre-approve WebSearch/MCP tools with no human to answer a prompt —
+    opt back in explicitly (``setting_sources: ["user"]``). Unknown entries
+    are dropped with a warning: a typo must neither silently widen isolation
+    nor quietly load an unintended source."""
+    raw = _provider_config().get("setting_sources")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    sources: list = []
+    for entry in raw:
+        name = str(entry or "").strip()
+        if name in _SDK_SETTING_SOURCES:
+            if name not in sources:
+                sources.append(name)
+        elif name:
+            logger.warning(
+                "agent.claude_agent_sdk.setting_sources entry %r is not a "
+                "valid SDK setting source (one of %s) — dropping it.",
+                name,
+                ", ".join(_SDK_SETTING_SOURCES),
+            )
+    return sources
+
+
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
 # contract: every needle is a phrase, never a bare token. Bare "401" matched
@@ -797,8 +834,12 @@ class ClaudeAgentSdkSession:
             # empty list is the SDK's documented isolation mode: settings
             # come from Hermes config only. Accepted side effect: "project"
             # is also what loads CLAUDE.md, which this runtime doesn't want —
-            # it composes its own system-prompt append.
-            "setting_sources": [],
+            # it composes its own system-prompt append. Operators whose
+            # deployment stores tool grants in ~/.claude/settings.json
+            # (unattended cron turns with nobody to answer a prompt) opt
+            # back in via agent.claude_agent_sdk.setting_sources — see
+            # _configured_setting_sources.
+            "setting_sources": _configured_setting_sources(),
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id

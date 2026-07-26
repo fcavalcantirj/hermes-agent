@@ -1314,6 +1314,63 @@ class TestStreaming:
             session.close()
         assert holder["client"].options["include_partial_messages"] is True
 
+    def test_setting_sources_isolated_by_default(self):
+        # Absent config → full isolation: the SDK loads NO filesystem
+        # settings, so ambient ~/.claude / project files cannot
+        # re-permission tools underneath the configured posture.
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["setting_sources"] == []
+
+    def test_setting_sources_config_opt_in(self, monkeypatch):
+        # Deployments whose operating model stores tool grants in the
+        # operator's own ~/.claude/settings.json (unattended cron turns that
+        # must pre-approve WebSearch/MCP tools) opt back in explicitly.
+        # Regression: the hardening initially shipped setting_sources
+        # hardcoded [] and silently cut a production box's cron jobs off
+        # from their allowlist (2026-07-26).
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"setting_sources": ["user"]}}
+            },
+        )
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["setting_sources"] == ["user"]
+
+    def test_setting_sources_invalid_entries_dropped(self, monkeypatch):
+        # A typo must never silently load an unintended source; valid
+        # entries survive, invalid ones are dropped (with a warning).
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {
+                    "claude_agent_sdk": {
+                        "setting_sources": ["user", "bogus", "project"]
+                    }
+                }
+            },
+        )
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["setting_sources"] == ["user", "project"]
+
     def test_deltas_reach_callback_and_never_the_transcript(self):
         got = []
         script = [
