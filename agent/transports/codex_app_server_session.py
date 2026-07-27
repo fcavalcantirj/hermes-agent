@@ -83,6 +83,12 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    # Non-None marks the turn's error as FATAL to the whole run — a
+    # startup/auth/billing refusal retries cannot fix ("startup", "auth") —
+    # so runtime glue can surface "failed"/"failure_reason" the way the
+    # chat_completions path does and one-shot CLI runs exit nonzero.
+    # Transient turn errors (timeout, in-turn SDK error) leave it None.
+    fatal_reason: Optional[str] = None
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.

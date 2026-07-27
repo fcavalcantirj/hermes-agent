@@ -628,6 +628,11 @@ def run_claude_agent_sdk_turn(
                 "api_calls": 0,
                 "completed": False,
                 "partial": True,
+                # run_turn consumes its own exceptions into TurnResult, so
+                # anything RAISING here is a dead turn, not a recoverable
+                # partial — mark it failed so one-shot runs exit nonzero
+                # (mirrors conversation_loop's generic non-retryable return).
+                "failed": True,
                 "error": str(exc),
             }
 
@@ -732,7 +737,7 @@ def run_claude_agent_sdk_turn(
             should_review_skills,
         )
 
-    return {
+    result = {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": 1,
@@ -746,6 +751,16 @@ def run_claude_agent_sdk_turn(
         "claude_sdk_session_id": turn.thread_id,
         **usage_result,
     }
+    # Fatal startup/auth/billing refusals surface the same machine-readable
+    # fields the chat_completions path sets (conversation_loop), so the -Q
+    # exit contract and gateway consumers see a real failure instead of a
+    # recoverable partial. getattr: test doubles build TurnResult-shaped
+    # namespaces that may predate the field.
+    _fatal = getattr(turn, "fatal_reason", None)
+    if _fatal:
+        result["failed"] = True
+        result["failure_reason"] = _fatal
+    return result
 
 
 __all__ = ["run_claude_agent_sdk_turn"]

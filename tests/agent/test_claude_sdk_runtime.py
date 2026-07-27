@@ -2111,3 +2111,92 @@ class TestSdkAvailabilityGate:
         ok, msg = check_claude_sdk_available()
         assert ok is False
         assert "hermes-agent[claude-agent-sdk]" in msg
+
+
+# ---------- fatal-reason plumbing: refusals must be machine-readable ----------
+# Clean-checkout E2E finding on #65982 (jefftropeano): a fatal metered-billing
+# refusal exited 0 because the runtime never sets "failed"/"failure_reason" —
+# the fields the chat_completions path sets (conversation_loop) and the -Q
+# exit path keys on. TurnResult.fatal_reason carries the classification out
+# of run_turn (the refusal exception never propagates past it).
+
+
+class TestFatalReason:
+    def test_metered_refusal_sets_fatal_reason_startup(self, monkeypatch):
+        # "startup", deliberately NOT "billing": the kanban -Q exit contract
+        # maps failure_reason "billing" to the transient EX_TEMPFAIL requeue
+        # sentinel, and a present metered key is a config error retries can't
+        # fix — it must count as a real failure everywhere.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
+        session = ClaudeAgentSdkSession(cwd="/tmp")  # no factory → real path
+        turn = session.run_turn("hi")
+        assert turn.should_retire
+        assert turn.fatal_reason == "startup"
+
+    def test_auth_classified_startup_failure_sets_fatal_reason_auth(self):
+        session, _ = _make_session(
+            connect_exc=RuntimeError("401 unauthorized: invalid bearer token")
+        )
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.should_retire
+        assert turn.fatal_reason == "auth"
+
+    def test_sdk_error_result_is_not_fatal(self):
+        # An in-turn SDK error (e.g. error_max_turns) is turn-scoped, not a
+        # startup/auth/billing refusal — it must stay non-fatal so one bad
+        # turn can't flip an integration's exit code.
+        script = [ResultMessage(subtype="error_max_turns", is_error=False)]
+        session, _ = _make_session(script=script)
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert turn.fatal_reason is None
+
+    def test_runtime_glue_maps_fatal_reason_to_failed(self):
+        agent = _make_agent()
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            should_retire=True,
+            error="claude-agent-sdk startup failed: refused",
+            fatal_reason="startup",
+            projected_messages=[],
+            final_text="",
+            token_usage_last=None,
+        )
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        assert result["failed"] is True
+        assert result["failure_reason"] == "startup"
+        assert result["partial"] is True
+
+    def test_runtime_glue_transient_error_stays_unfailed(self):
+        # A retire without fatal_reason (timeout, transient turn error) keeps
+        # today's contract: partial, no "failed" key — gateway/CLI treat it
+        # as a recoverable turn, not a dead run.
+        agent = _make_agent()
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            should_retire=True,
+            error="turn timed out after 600s",
+            projected_messages=[],
+            final_text="",
+            token_usage_last=None,
+        )
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        assert not result.get("failed")
+        assert "failure_reason" not in result
+

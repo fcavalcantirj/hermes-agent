@@ -507,6 +507,13 @@ class ClaudeAgentSdkSession:
             hint = classify_auth_failure(str(exc))
             result.error = hint or f"claude-agent-sdk startup failed: {exc}"
             result.should_retire = True
+            # A refusal to start is fatal to the run, not turn-scoped: the
+            # metered-key guard and an uninstallable SDK are config errors
+            # ("startup" — NOT "billing": kanban maps failure_reason
+            # "billing" to the transient EX_TEMPFAIL requeue sentinel, and
+            # retrying cannot fix a present metered key); an auth-classified
+            # failure is "auth".
+            result.fatal_reason = "auth" if hint else "startup"
             return result
 
         # An interrupt that arrived between turns or during connect (up to
@@ -532,6 +539,10 @@ class ClaudeAgentSdkSession:
             hint = classify_auth_failure(str(exc))
             result.error = hint or f"claude-agent-sdk turn failed: {exc}"
             result.should_retire = True
+            if hint is not None:
+                # Auth failures are fatal; other mid-turn exceptions stay
+                # transient (retire + retry semantics unchanged).
+                result.fatal_reason = "auth"
             return result
 
         result.final_text = turn_data["final_text"]
@@ -551,6 +562,7 @@ class ClaudeAgentSdkSession:
             result.error = hint or turn_data["error"]
             if hint is not None:
                 result.should_retire = True
+                result.fatal_reason = "auth"
         return result
 
     # ---------- internals ----------
