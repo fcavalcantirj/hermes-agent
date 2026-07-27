@@ -2335,6 +2335,79 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def build_sdk_gateway_approval_callback():
+    """Approval callback for external agent-loop runtimes (claude-agent-sdk)
+    running under the gateway: bridges the SDK's per-tool permission request
+    onto the same per-session queue + notify machinery the native terminal
+    guard uses, so the user gets a real chat approval prompt instead of a
+    silent SDK-internal deny.
+
+    Returns None outside an interactive gateway approval context — the CLI
+    keeps its thread-local callback (tools.terminal_tool), and cron/headless
+    sessions keep their allowlist-or-deny posture: a nightly turn must never
+    block on a prompt. ``_is_gateway_approval_context`` is the SSOT for that
+    distinction.
+
+    The session key is bound EARLY, at SDK-session creation on the agent
+    turn thread where ``set_current_session_key`` bound the contextvar — the
+    SDK invokes the callback from its own loop thread, where the contextvar
+    is not propagated. The notify callback is looked up at CALL time because
+    gateway registration is per-turn (register/unregister_gateway_notify).
+
+    Known v1 semantics (deliberate, documented trade-offs):
+
+    - The wait runs on the SDK loop's ``asyncio.to_thread`` worker, not the
+      agent execution thread — so the wait loop's ``is_interrupted()``
+      fast-deny and activity heartbeats do not apply to this surface. /stop
+      interrupts the TURN at the SDK level; the orphaned wait self-expires
+      at the approval timeout and its result is discarded. Operators raising
+      ``approvals.timeout`` should keep it under the agent watchdog timeout.
+    - The approval wait spends the SDK turn's own budget (``run_turn``
+      ``turn_timeout``, 600s): one ignored prompt costs the approval timeout
+      (default 300s); a second ignored prompt can time the turn out, which
+      retires the session (digest-resume next turn) and orphans the
+      displayed prompt. The interactive one-tap flow this bridge exists for
+      is unaffected.
+    """
+    if not _is_gateway_approval_context():
+        return None
+    session_key = get_current_session_key("")
+    if not session_key:
+        return None
+
+    def _sdk_gateway_approval(command: str, description: str, *,
+                              allow_permanent: bool = False) -> str:
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is None:
+            # No live turn registration (gateway tearing down, or the warm
+            # session outlived its turn): fail closed, exactly like the SDK
+            # would without a bridge.
+            return "deny"
+        approval_data = {
+            "command": command,
+            "pattern_key": "claude_sdk_tool",
+            "pattern_keys": ["claude_sdk_tool"],
+            "description": description,
+            # One-tap "once" grants only: durable grants for SDK tools
+            # belong in the operator's settings.json (setting_sources),
+            # where they are auditable — not in chat-tap persistence.
+            "allow_permanent": False,
+            "allow_session": False,
+        }
+        decision = _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="claude_sdk"
+        )
+        if not decision.get("resolved") or decision.get("choice") in (None, "deny"):
+            return "deny"
+        # Clamp durable choices to one-shot: an older client button can
+        # still send "session"/"always"; the grant must not outlive the
+        # single SDK permission request it answered.
+        return "once"
+
+    return _sdk_gateway_approval
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None) -> int:
@@ -3486,10 +3559,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         # Respect interrupt signals (e.g. /stop, /new, or an inactivity
         # timeout from the gateway) so a pending approval doesn't keep the
         # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
+        # timeout. For the native surfaces the wait runs on the agent's
+        # execution thread, which is the exact thread AIAgent.interrupt()
+        # flags — so is_interrupted() here sees the signal. Resolve as "deny"
+        # so the agent loop receives a normal denial and unwinds cleanly
+        # (#8697). Exception: surface="claude_sdk" waits on the SDK loop's
+        # to_thread worker, which interrupts never flag — that surface
+        # unblocks via turn teardown/unregister or the approval timeout (see
+        # build_sdk_gateway_approval_callback's docstring).
         if is_interrupted():
             logger.info(
                 "Approval wait interrupted by user signal — "

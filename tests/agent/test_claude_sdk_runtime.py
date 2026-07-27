@@ -2200,3 +2200,177 @@ class TestFatalReason:
         assert not result.get("failed")
         assert "failure_reason" not in result
 
+
+# ---------- gateway approval bridge: SDK permission prompts reach the chat ----------
+# Production finding (dasbrow 24/7 box): under the gateway, _create_session's
+# thread-local CLI callback is always None, so mode=default wired
+# can_use_tool=None and the SDK denied every un-allowlisted tool silently —
+# no Telegram prompt ever reached the operator, though the gateway registers
+# a notify channel around every turn. The bridge routes SDK permission
+# requests onto that same tools.approval queue.
+
+
+class TestGatewayApprovalBridge:
+    def _gateway_ctx(self, monkeypatch, session_key):
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        token = approval_mod.set_current_session_key(session_key)
+        return approval_mod, token
+
+    def test_builder_returns_none_outside_gateway_context(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        from tools.approval import build_sdk_gateway_approval_callback
+
+        assert build_sdk_gateway_approval_callback() is None
+
+    def test_builder_returns_none_for_cron_sessions(self, monkeypatch):
+        # A nightly turn must never block on a prompt: cron keeps the
+        # settings.json allowlist-or-deny posture.
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        from tools.approval import build_sdk_gateway_approval_callback
+
+        assert build_sdk_gateway_approval_callback() is None
+
+    def test_gateway_context_wires_can_use_tool(self, monkeypatch):
+        approval_mod, token = self._gateway_ctx(monkeypatch, "tg:152:main")
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert cb is not None
+            session, _ = _make_session(
+                approval_callback=cb, permission_mode="default"
+            )
+            assert session.build_option_fields()["can_use_tool"] is not None
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_no_registered_notify_denies(self, monkeypatch):
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-no-notify")
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert cb("Bash(ls)", "Claude requests tool Bash") == "deny"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def _resolve_with(self, approval_mod, session_key, choice):
+        seen = []
+
+        def notify(data):
+            seen.append(data)
+            with approval_mod._lock:
+                entry = approval_mod._gateway_queues[session_key][0]
+            entry.result = choice
+            entry.event.set()
+
+        return notify, seen
+
+    def test_approve_maps_to_once_and_clamps_durable_choices(self, monkeypatch):
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-mapped")
+        try:
+            # An older client button can still send "always" — the grant must
+            # not outlive the single SDK permission request it answered.
+            notify, seen = self._resolve_with(approval_mod, "sess-mapped", "always")
+            approval_mod.register_gateway_notify("sess-mapped", notify)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert cb("Bash(uname)", "Claude requests tool Bash") == "once"
+            finally:
+                approval_mod.unregister_gateway_notify("sess-mapped")
+            assert seen[0]["allow_permanent"] is False
+            assert seen[0]["allow_session"] is False
+            assert seen[0]["command"] == "Bash(uname)"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_deny_choice_denies(self, monkeypatch):
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-denied")
+        try:
+            notify, _ = self._resolve_with(approval_mod, "sess-denied", "deny")
+            approval_mod.register_gateway_notify("sess-denied", notify)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert cb("Bash(rm x)", "desc") == "deny"
+            finally:
+                approval_mod.unregister_gateway_notify("sess-denied")
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_create_session_falls_back_to_gateway_bridge(self, monkeypatch):
+        # The runtime seam: no thread-local CLI callback + gateway context →
+        # the session is constructed with the bridge callback, not None.
+        from tools import approval as approval_mod
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(
+                    projected_messages=[], final_text="ok",
+                    token_usage_last=None,
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        token = approval_mod.set_current_session_key("tg:152:bridge")
+        try:
+            monkeypatch.setattr(
+                session_mod, "ClaudeAgentSdkSession", _CapturingSession
+            )
+            agent = _make_agent()
+            agent._claude_sdk_session = None
+            run_claude_agent_sdk_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="task-1",
+            )
+            assert captured.get("approval_callback") is not None
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
+        # CLI/bare-process posture unchanged: no context → callback stays None.
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(
+                    projected_messages=[], final_text="ok",
+                    token_usage_last=None,
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            session_mod, "ClaudeAgentSdkSession", _CapturingSession
+        )
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+        assert captured.get("approval_callback") is None

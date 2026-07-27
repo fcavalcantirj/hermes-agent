@@ -511,6 +511,19 @@ def run_claude_agent_sdk_turn(
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+        if approval_callback is None:
+            # Gateway turns have no thread-local CLI callback — without this
+            # bridge the SDK denies every un-allowlisted tool silently, no
+            # prompt reaching the user, even though the gateway registers a
+            # notify channel around every turn (production finding on a 24/7
+            # telegram deployment). The builder returns None outside
+            # interactive gateway sessions, so CLI and cron postures are
+            # unchanged.
+            try:
+                from tools.approval import build_sdk_gateway_approval_callback
+                approval_callback = build_sdk_gateway_approval_callback()
+            except Exception:
+                approval_callback = None
 
         def _on_tool_started(tool_name: str, preview: str, args: dict) -> None:
             progress_callback = getattr(agent, "tool_progress_callback", None)
