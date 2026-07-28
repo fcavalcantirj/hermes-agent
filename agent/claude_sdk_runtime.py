@@ -93,8 +93,9 @@ def build_system_prompt_append(
     Hermes' own prompt composer is bypassed on this runtime; this is its
     replacement, built from the SAME native builders (W2 composer parity):
 
-      1. Operator persona/soul file (agent.claude_agent_sdk.append_file) —
-         identity lives here.
+      1. Operator persona/soul file — agent.claude_agent_sdk.append_file
+         when set, else the native $HERMES_HOME/SOUL.md via load_soul_md
+         (the same identity slot #1 the native composer fills).
       2. Session line — the native volatile-tier format (date-only for
          prefix-cache stability) + session id / model / provider.
       3. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
@@ -124,10 +125,25 @@ def build_system_prompt_append(
         if soul:
             blocks.append(soul)
         else:
+            # Deliberately NO SOUL.md fallback here: a set-but-unreadable
+            # append_file is operator intent gone wrong — warn, don't guess.
             logger.warning(
                 "agent.claude_agent_sdk.append_file=%s is set but unreadable/empty",
                 soul_path,
             )
+    else:
+        # W2 composer parity: the native composer's identity slot #1 is
+        # $HERMES_HOME/SOUL.md (system_prompt.py); load it through the SAME
+        # native builder — injection scan and dynamic truncation included —
+        # when no explicit append_file overrides it (#65982 R2).
+        try:
+            from agent.prompt_builder import load_soul_md
+
+            soul = load_soul_md()
+            if soul:
+                blocks.append(soul)
+        except Exception:  # pragma: no cover - never block session creation
+            logger.debug("native SOUL.md load failed", exc_info=True)
 
     # Session line — mirrors the native composer's volatile tier
     # (system_prompt.py): date-only so the append stays byte-stable all day.

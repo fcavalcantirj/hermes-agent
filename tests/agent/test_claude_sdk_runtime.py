@@ -1800,6 +1800,33 @@ class TestSystemPromptAppend:
         assert out.startswith("# I am the persona under test")
         assert "The user prefers concise results" in out
 
+    def test_native_soul_md_autoloads_when_append_file_unset(
+        self, tmp_path, monkeypatch
+    ):
+        # R2 (#65982, romain-bury): the native composer treats
+        # $HERMES_HOME/SOUL.md as identity slot #1; W2 composer parity means
+        # this path must load it too when no explicit append_file overrides.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        home = self._home(tmp_path, monkeypatch)
+        (home / "SOUL.md").write_text("# Native soul identity")
+        out = build_system_prompt_append()
+        assert out is not None
+        assert out.startswith("# Native soul identity")
+
+    def test_append_file_wins_over_native_soul_md(self, tmp_path, monkeypatch):
+        # append_file stays the explicit operator override.
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        home = self._home(
+            tmp_path, monkeypatch, soul="# Override persona"
+        )
+        (home / "SOUL.md").write_text("# Native soul identity")
+        out = build_system_prompt_append()
+        assert out is not None
+        assert out.startswith("# Override persona")
+        assert "# Native soul identity" not in out
+
     def test_gauge_blocks_are_the_native_render(self, tmp_path, monkeypatch):
         # Byte-pin: the memory/user blocks are EXACTLY what the native
         # composer injects (MemoryStore.format_for_system_prompt output,
