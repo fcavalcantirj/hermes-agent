@@ -246,6 +246,20 @@ _METERED_ENV_DENYLIST = (
 )
 
 
+def _is_subscription_oauth_token(value: str) -> bool:
+    """True when an ANTHROPIC_TOKEN value is OAuth/setup-token shaped — the
+    subscription lane itself, not a metered vector. Unknown shapes count as
+    metered (fail closed), including when the classifier cannot be imported."""
+    try:
+        from agent.anthropic_adapter import _is_oauth_token
+    except Exception:
+        return False
+    try:
+        return bool(_is_oauth_token(value))
+    except Exception:
+        return False
+
+
 def _scrubbed_sdk_env() -> dict[str, str]:
     """Empty-string overrides for every metered billing vector currently set
     in the parent environment. Only PRESENT keys are overridden — writing
@@ -417,16 +431,24 @@ class ClaudeAgentSdkSession:
         # Hard rule, enforced fail-closed: this provider exists to bill the
         # Claude SUBSCRIPTION. If a metered ANTHROPIC_API_KEY is present the
         # underlying CLI would silently prefer it — refuse to start instead.
+        # ANTHROPIC_TOKEN is in the set because it alone authenticates
+        # Hermes' NATIVE Anthropic lane (x-api-key, metered) — but Hermes
+        # also persists subscription setup tokens there, so only an
+        # API-key-shaped value counts as a metered vector.
         allow_metered = _provider_flag("allow_metered_key")
-        for metered_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-            if os.environ.get(metered_var) and not allow_metered:
-                raise RuntimeError(
-                    f"claude-agent-sdk runtime refuses to start: {metered_var} "
-                    "is set, which would silently switch billing from the "
-                    "Claude subscription to metered API usage. Unset it, or "
-                    "set agent.claude_agent_sdk.allow_metered_key: true in "
-                    "config.yaml to explicitly allow it."
-                )
+        for metered_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN"):
+            value = os.environ.get(metered_var)
+            if not value or allow_metered:
+                continue
+            if metered_var == "ANTHROPIC_TOKEN" and _is_subscription_oauth_token(value):
+                continue
+            raise RuntimeError(
+                f"claude-agent-sdk runtime refuses to start: {metered_var} "
+                "is set, which would silently switch billing from the "
+                "Claude subscription to metered API usage. Unset it, or "
+                "set agent.claude_agent_sdk.allow_metered_key: true in "
+                "config.yaml to explicitly allow it."
+            )
         if self._client_factory is None:
             ok, msg = check_claude_sdk_available()
             if not ok:

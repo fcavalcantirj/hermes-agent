@@ -2374,3 +2374,52 @@ class TestGatewayApprovalBridge:
             effective_task_id="task-1",
         )
         assert captured.get("approval_callback") is None
+
+
+class TestAnthropicTokenGuard:
+    """F1 follow-up (#65982 independent verification): ANTHROPIC_TOKEN alone
+    authenticates hermes' native metered lane, so an API-key-shaped value is
+    the same fail-closed class as ANTHROPIC_API_KEY — while an OAuth-shaped
+    value is the subscription lane itself and must keep working."""
+
+    def test_anthropic_token_api_key_shaped_refuses_startup(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-api03-fake")
+        session = ClaudeAgentSdkSession(cwd="/tmp")  # no factory → real path
+        turn = session.run_turn("hi")
+        assert turn.should_retire
+        assert "ANTHROPIC_TOKEN" in (turn.error or "")
+
+    def test_anthropic_token_oauth_shaped_starts_normally(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-fake")
+        session, _holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            turn = session.run_turn("ping")
+        finally:
+            session.close()
+        assert turn.error is None
+
+    def test_allow_metered_key_admits_api_key_shaped_token(self, monkeypatch):
+        import hermes_cli.config as cfg
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-api03-fake")
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"allow_metered_key": True}}
+            },
+            raising=False,
+        )
+        session, _holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            turn = session.run_turn("ping")
+        finally:
+            session.close()
+        assert turn.error is None
+
