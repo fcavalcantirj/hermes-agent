@@ -572,6 +572,7 @@ class ClaudeAgentSdkSession:
         result.tool_iterations = turn_data["tool_iterations"]
         result.token_usage_last = turn_data["usage"]
         result.token_usage_total = turn_data["usage"]
+        result.model_last = turn_data.get("model")
         result.thread_id = self._session_id
         result.turn_id = turn_data.get("result_uuid")
         result.interrupted = self._interrupt_event.is_set()
@@ -604,6 +605,7 @@ class ClaudeAgentSdkSession:
             "usage": None,
             "error": None,
             "result_uuid": None,
+            "model": None,
         }
         ended = self._stream_ended
         if ended is not None:
@@ -647,6 +649,10 @@ class ClaudeAgentSdkSession:
                 if not interrupted:
                     self._notify_tool_started(message)
                 projection = projector.project(message)
+                if projection.model:
+                    # Last reported id wins; captured even on interrupted
+                    # turns — the tokens were still spent on that model.
+                    out["model"] = projection.model
                 if not interrupted:
                     if projection.messages:
                         out["messages"].extend(projection.messages)

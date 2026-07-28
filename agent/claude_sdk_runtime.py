@@ -272,6 +272,11 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
     Claude subscription; there is no per-token invoice on this path)."""
     agent.session_api_calls += 1
 
+    # Attribution: the configured model wins; when it is unset (documented
+    # default — the CLI picks), back-fill from the model id the SDK itself
+    # reported so usage rows stop reading model='unknown'.
+    resolved_model = agent.model or getattr(turn, "model_last", None) or ""
+
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
         if agent._session_db and agent.session_id:
@@ -280,7 +285,7 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
                     agent._ensure_db_session()
                 agent._session_db.update_token_counts(
                     agent.session_id,
-                    model=agent.model,
+                    model=resolved_model,
                     billing_provider=agent.provider,
                     billing_base_url=agent.base_url,
                     billing_mode="subscription_included",
@@ -358,7 +363,7 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included",
-                model=agent.model,
+                model=resolved_model,
                 api_call_count=1,
             )
         except Exception as exc:

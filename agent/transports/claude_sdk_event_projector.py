@@ -83,6 +83,7 @@ class ProjectionResult:
     is_tool_iteration: bool = False
     final_text: Optional[str] = None  # Set when text lands / on ResultMessage
     is_result: bool = False  # True only for the terminal ResultMessage
+    model: Optional[str] = None  # Model id the SDK reported for this message
 
 
 class ClaudeSdkEventProjector:
@@ -148,7 +149,8 @@ class ClaudeSdkEventProjector:
             # types (server tool results, …) are ignored here on purpose.
 
         if not text_parts and not tool_calls:
-            return ProjectionResult()
+            # Thinking-only messages still carry the model id.
+            return ProjectionResult(model=getattr(message, "model", None) or None)
 
         msg: dict[str, Any] = {
             "role": "assistant",
@@ -160,7 +162,11 @@ class ClaudeSdkEventProjector:
             msg["reasoning"] = "\n".join(self._pending_thinking)
             self._pending_thinking = []
         final_text = "\n".join(text_parts) if text_parts else None
-        return ProjectionResult(messages=[msg], final_text=final_text)
+        return ProjectionResult(
+            messages=[msg],
+            final_text=final_text,
+            model=getattr(message, "model", None) or None,
+        )
 
     def _project_user(self, message: Any) -> ProjectionResult:
         """SDK UserMessages inside a response stream carry tool results."""
@@ -192,4 +198,5 @@ class ClaudeSdkEventProjector:
         return ProjectionResult(
             final_text=final if isinstance(final, str) and final else None,
             is_result=True,
+            model=getattr(message, "model", None) or None,
         )

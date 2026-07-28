@@ -74,6 +74,10 @@ class TurnResult:
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
+    # Model id the runtime actually reported for this turn (e.g. from the
+    # SDK's AssistantMessage). Backfills usage attribution when the agent's
+    # configured model is unset and the runtime picked its own default.
+    model_last: Optional[str] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Hint to the caller that the underlying codex subprocess is likely

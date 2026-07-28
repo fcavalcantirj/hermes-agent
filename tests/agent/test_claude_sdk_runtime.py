@@ -2423,3 +2423,53 @@ class TestAnthropicTokenGuard:
             session.close()
         assert turn.error is None
 
+
+
+class TestModelAttribution:
+    """F3 (#65982 independent verification): with model.default unset the
+    usage rows carried model='unknown' while the SDK's own AssistantMessage
+    knew the real id — capture it and back-fill the attribution."""
+
+    def test_session_captures_model_last_from_assistant_message(self):
+        script = [
+            AssistantMessage(
+                content=[TextBlock("hey")], model="claude-opus-4-8-20260115"
+            ),
+            ResultMessage(
+                result="hey", usage={"input_tokens": 1, "output_tokens": 1}
+            ),
+        ]
+        session, _holder = _make_session(script=script)
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.model_last == "claude-opus-4-8-20260115"
+
+    def test_usage_row_backfills_model_from_turn(self):
+        from agent.claude_sdk_runtime import _record_claude_sdk_usage
+
+        agent = _make_agent()
+        agent.model = ""
+        db = MagicMock()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = "sess-attr-1"
+        turn = _make_turn(model_last="claude-opus-4-8-20260115")
+        _record_claude_sdk_usage(agent, turn)
+        kwargs = db.update_token_counts.call_args.kwargs
+        assert kwargs["model"] == "claude-opus-4-8-20260115"
+
+    def test_explicit_agent_model_still_wins(self):
+        from agent.claude_sdk_runtime import _record_claude_sdk_usage
+
+        agent = _make_agent()
+        agent.model = "claude-sonnet-5"
+        db = MagicMock()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = "sess-attr-2"
+        turn = _make_turn(model_last="claude-opus-4-8-20260115")
+        _record_claude_sdk_usage(agent, turn)
+        kwargs = db.update_token_counts.call_args.kwargs
+        assert kwargs["model"] == "claude-sonnet-5"
