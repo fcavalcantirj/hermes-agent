@@ -68,26 +68,25 @@ def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
 
     real_connect = sqlite3.connect
 
-    class _ProbeErrorConn:
-        def __init__(self, real):
-            self.__dict__["_real"] = real
+    def _probe_error_connect(*args, **kwargs):
+        # connect_tracked passes its tracking factory via kwargs and honours
+        # test-owned openers (sqlite_safe_read's documented contract). Derive
+        # the fake from WHATEVER factory arrives so the connection stays a
+        # real sqlite3.Connection subclass (a plain object proxy dies in
+        # _retrofit_tracking's __class__ swap) and tracking stays intact —
+        # only trigram statements error, everything else runs for real.
+        base = kwargs.get("factory", sqlite3.Connection)
 
-        def execute(self, sql, *args, **kwargs):
-            if "messages_fts_trigram" in sql:
-                raise sqlite3.OperationalError(message)
-            return self.__dict__["_real"].execute(sql, *args, **kwargs)
+        class _ProbeErrorConnection(base):
+            def execute(self, sql, *a, **k):
+                if isinstance(sql, str) and "messages_fts_trigram" in sql:
+                    raise sqlite3.OperationalError(message)
+                return super().execute(sql, *a, **k)
 
-        def __getattr__(self, name):
-            return getattr(self.__dict__["_real"], name)
+        kwargs["factory"] = _ProbeErrorConnection
+        return real_connect(*args, **kwargs)
 
-        def __setattr__(self, name, value):
-            setattr(self.__dict__["_real"], name, value)
-
-    monkeypatch.setattr(
-        hermes_state.sqlite3,
-        "connect",
-        lambda *args, **kwargs: _ProbeErrorConn(real_connect(*args, **kwargs)),
-    )
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", _probe_error_connect)
     return SessionDB(db_path=db_path, read_only=True)
 
 
