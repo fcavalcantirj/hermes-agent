@@ -977,6 +977,21 @@ def run_doctor(args):
             except Exception:
                 _resolve_auth_provider = None
                 pass
+            # Pluggable model providers (plugins/model-providers/<name>/) are
+            # valid model.provider values without a PROVIDER_REGISTRY entry —
+            # e.g. claude-agent-sdk. Same philosophy as the API-key health
+            # list: adding the plugin profile is sufficient to get into doctor.
+            try:
+                from providers import list_providers as _list_provider_profiles
+                for _profile in _list_provider_profiles():
+                    _pname = getattr(_profile, "name", None)
+                    if _pname:
+                        known_providers.add(str(_pname).strip().lower())
+                    for _palias in getattr(_profile, "aliases", None) or ():
+                        if _palias:
+                            known_providers.add(str(_palias).strip().lower())
+            except Exception:
+                pass
             try:
                 from hermes_cli.config import get_compatible_custom_providers as _compatible_custom_providers
                 from hermes_cli.providers import (
