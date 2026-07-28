@@ -544,6 +544,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
 
+    # Credentials channel (C4-compliant): read ~/.hermes/.env from DISK inside
+    # this child, like every other Hermes entry point (run_agent, cli, main,
+    # gateway). The spawn env is the ps-visible --mcp-config argv and stays a
+    # minimal non-secret allowlist; without this load, tool check_fns that
+    # consult raw os.environ miss .env-stored creds and the tools they gate
+    # report unavailable (#65982 R3).
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv()
+    except Exception:
+        logger.debug("hermes dotenv load failed", exc_info=True)
+
     try:
         server = _build_server()
     except ImportError as exc:

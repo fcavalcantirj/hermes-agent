@@ -339,3 +339,32 @@ class TestShimRegistration:
 
         out = handle_function_call("memory", {"action": "add", "content": "x"})
         assert "must be handled by the agent loop" in out
+
+
+class TestWrapperDotenvLoad:
+    def test_main_loads_hermes_dotenv_before_building_server(self, monkeypatch):
+        # R3 companion (#65982, romain-bury): the wrapper's spawn env is the
+        # ps-visible --mcp-config argv (C4 minimal allowlist — no creds), so
+        # the C4-compliant credential channel is DISK. Every other Hermes
+        # entry point loads ~/.hermes/.env at startup (run_agent, cli, main,
+        # gateway); the wrapper must too, or tool check_fns that consult raw
+        # os.environ miss .env-stored creds and report tools unavailable.
+        import agent.transports.hermes_tools_mcp_server as srv
+        import hermes_cli.env_loader as env_loader
+
+        calls = []
+        monkeypatch.setattr(
+            env_loader,
+            "load_hermes_dotenv",
+            lambda *a, **k: (calls.append("dotenv"), [])[1],
+        )
+
+        class _StubServer:
+            def run(self):
+                calls.append("run")
+
+        monkeypatch.setattr(srv, "_build_server", lambda: (calls.append("build"), _StubServer())[1])
+        rc = srv.main([])
+        assert rc == 0
+        assert calls[0] == "dotenv", f"dotenv must load before anything else, got {calls}"
+        assert "build" in calls and "run" in calls
