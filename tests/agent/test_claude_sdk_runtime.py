@@ -77,6 +77,7 @@ class ToolResultBlock:
 class AssistantMessage:
     content: list
     model: str = "claude-opus-4-8"
+    parent_tool_use_id: Optional[str] = None
 
 
 @dataclass
@@ -2500,3 +2501,190 @@ class TestModelAttribution:
         _record_claude_sdk_usage(agent, turn)
         kwargs = db.update_token_counts.call_args.kwargs
         assert kwargs["model"] == "claude-sonnet-5"
+
+
+class TestUnsolicitedDelivery:
+    """The delivery half of the stream-ownership fix (dasbrow-hermes-coder#2):
+    a finished background Agent task's answer must be CAPTURED and handed to
+    the delivery callback — never served as a turn result (TestStreamOwnership
+    pins that), and never silently discarded either (observed live 2026-07-29:
+    14 dropped answers, 32-minute silences until the operator poked)."""
+
+    @staticmethod
+    def _wait(cond, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_callback_receives_unsolicited_result_text(self):
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(
+                AssistantMessage(content=[TextBlock("research done: Tupã wins")]),
+                ResultMessage(result="research done: Tupã wins", uuid="bg-1"),
+            )
+            assert self._wait(lambda: got)
+        finally:
+            session.close()
+        assert got == ["research done: Tupã wins"]
+        # Observability unchanged: the counter still ticks.
+        assert session._unsolicited_results == 1
+
+    def test_falls_back_to_buffered_assistant_text(self):
+        # Some CLI results arrive with result=None; the assistant text blocks
+        # of the unsolicited turn are the answer then.
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(
+                AssistantMessage(content=[TextBlock("the long answer body")]),
+                ResultMessage(result=None, uuid="bg-2"),
+            )
+            assert self._wait(lambda: got)
+        finally:
+            session.close()
+        assert got == ["the long answer body"]
+
+    def test_result_uuid_deduplicated(self):
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(ResultMessage(result="answer", uuid="dup-1"))
+            assert self._wait(lambda: got)
+            holder["client"].feed(ResultMessage(result="answer", uuid="dup-1"))
+            self._wait(lambda: len(got) >= 2, timeout=0.5)
+        finally:
+            session.close()
+        assert got == ["answer"]
+
+    def test_subagent_text_excluded_from_buffer(self):
+        # parent_tool_use_id set = subagent stream noise — same gate the
+        # stream-delta forwarder uses. Only top-level text is the answer.
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(
+                AssistantMessage(
+                    content=[TextBlock("sub noise")], parent_tool_use_id="t1"
+                ),
+                AssistantMessage(content=[TextBlock("top-level answer")]),
+                ResultMessage(result=None, uuid="bg-3"),
+            )
+            assert self._wait(lambda: got)
+        finally:
+            session.close()
+        assert got == ["top-level answer"]
+
+    def test_no_callback_keeps_drop_semantics(self):
+        # Without a wired callback the historical WARN+counter drop stands
+        # (TestStreamOwnership's pins rely on it).
+        session, holder = _make_session()
+        try:
+            session.ensure_started()
+            holder["client"].feed(ResultMessage(result="x", uuid="nc-1"))
+            assert self._wait(
+                lambda: getattr(session, "_unsolicited_results", 0) >= 1
+            )
+        finally:
+            session.close()
+        assert session._unsolicited_results == 1
+
+
+class TestBackgroundDeliveryWiring:
+    """Runtime glue: the session's delivery callback feeds the gateway's
+    existing async-delegation completion pipeline, config-gated."""
+
+    def _spy_kwargs(self, monkeypatch):
+        import agent.claude_sdk_runtime as runtime_mod
+
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input, **kw):
+                return _make_turn()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.claude_agent_sdk_session.ClaudeAgentSdkSession",
+            SpySession,
+        )
+        return captured
+
+    def test_flag_on_wires_callback_and_queue_event(self, monkeypatch):
+        import hermes_cli.config as cfg
+        from tools.process_registry import process_registry
+
+        captured = self._spy_kwargs(monkeypatch)
+        events = []
+
+        class _FakeQueue:
+            def put(self, evt):
+                events.append(evt)
+
+        monkeypatch.setattr(process_registry, "completion_queue", _FakeQueue())
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: "gw-key-7"
+        )
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        # Opt-in flag (upstream-conservative default is OFF).
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"deliver_background_results": True}}
+            },
+            raising=False,
+        )
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent.session_id = "sess-bg-1"
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        callback = captured.get("on_unsolicited_result")
+        assert callback is not None, "flag defaults ON — callback must be wired"
+        callback("background answer text")
+        assert len(events) == 1
+        evt = events[0]
+        assert evt["type"] == "async_delegation"
+        assert evt["status"] == "completed"
+        assert evt["summary"] == "background answer text"
+        assert evt["session_key"] == "gw-key-7"
+        assert evt["parent_session_id"] == "sess-bg-1"
+        assert evt["delegation_id"] == ""
+
+    def test_flag_off_leaves_callback_unwired(self, monkeypatch):
+        import hermes_cli.config as cfg
+
+        captured = self._spy_kwargs(monkeypatch)
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"deliver_background_results": False}}
+            },
+            raising=False,
+        )
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert captured.get("on_unsolicited_result") is None

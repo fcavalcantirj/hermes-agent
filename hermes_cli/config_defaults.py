@@ -280,6 +280,14 @@ DEFAULT_CONFIG = {
             # budget. Non-numeric / non-positive values are ignored with a
             # warning.
             "max_budget_usd": None,
+            # Deliver finished background Agent-task answers proactively via
+            # the gateway's async-delegation completion pipeline. false (the
+            # upstream-conservative default) = the historical behavior: the
+            # CLI's unsolicited completion turn is dropped with a WARN and
+            # the answer stays in the CLI session until the user asks again.
+            # Deployments whose users receive background work through chat
+            # (gateway bots) want true.
+            "deliver_background_results": False,
             # SDK setting sources, taken as claude-agent-sdk SettingSource
             # literals: user | project | local. [] (the default) is full
             # isolation — the spawned CLI loads NO filesystem settings, so

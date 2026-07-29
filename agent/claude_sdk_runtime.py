@@ -573,6 +573,66 @@ def run_claude_agent_sdk_turn(
             session_id=getattr(agent, "session_id", None),
             model=getattr(agent, "model", None),
         )
+
+        # Delivery half of the stream-ownership fix: when the CLI finishes a
+        # background Agent task between turns, the session captures the
+        # answer and this callback feeds the gateway's EXISTING
+        # async-delegation completion pipeline (completion_queue →
+        # _async_delegation_watcher → synthetic internal turn → platform
+        # send). Empty delegation_id deliberately skips the durable-claim
+        # branch — v1 is in-memory at-least-once, same as the watcher's
+        # requeue semantics. Config-gated, default OFF per the block's
+        # upstream-conservative contract (every default falsy — pinned by
+        # test_canonical_defaults); gateway-bot deployments opt in.
+        on_unsolicited_result = None
+        from agent.transports.claude_agent_sdk_session import _provider_flag
+
+        if _provider_flag("deliver_background_results", default=False):
+            try:
+                from tools.approval import get_current_session_key
+
+                _bg_session_key = get_current_session_key() or ""
+            except Exception:
+                _bg_session_key = ""
+            _bg_parent_session_id = getattr(agent, "session_id", None)
+            _bg_model = getattr(agent, "model", None)
+
+            def _deliver_background_result(text: str) -> None:
+                try:
+                    import time as _time
+
+                    from tools.process_registry import process_registry
+
+                    now = _time.time()
+                    process_registry.completion_queue.put({
+                        "type": "async_delegation",
+                        "delegation_id": "",
+                        "session_key": _bg_session_key,
+                        "origin_ui_session_id": "",
+                        "origin_session_id": "",
+                        "parent_session_id": _bg_parent_session_id,
+                        "goal": "background Agent task (claude-agent-sdk)",
+                        "context": None,
+                        "toolsets": None,
+                        "role": None,
+                        "model": _bg_model,
+                        "status": "completed",
+                        "summary": text,
+                        "error": None,
+                        "api_calls": 0,
+                        "duration_seconds": 0.0,
+                        "dispatched_at": now,
+                        "completed_at": now,
+                        "exit_reason": None,
+                    })
+                except Exception:
+                    logger.warning(
+                        "claude-sdk background-result enqueue failed — "
+                        "answer may be lost", exc_info=True,
+                    )
+
+            on_unsolicited_result = _deliver_background_result
+
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
@@ -582,6 +642,7 @@ def run_claude_agent_sdk_turn(
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
             on_stream_delta=_relay_stream_delta,
+            on_unsolicited_result=on_unsolicited_result,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
             # applies on the next session, same as the append snapshot.

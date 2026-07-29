@@ -377,6 +377,7 @@ class ClaudeAgentSdkSession:
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
+        on_unsolicited_result: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -420,6 +421,15 @@ class ClaudeAgentSdkSession:
         self._turn_inbox: Any = None
         self._unsolicited_results = 0
         self._stream_ended: Optional[_StreamEnd] = None
+        # Delivery half of the stream-ownership fix (dasbrow-hermes-coder#2):
+        # a finished background Agent task's answer is captured here and
+        # handed to the callback — it must never enter a turn's result, but
+        # dropping it entirely left completed work silently undelivered
+        # (observed live 2026-07-29: answers sat in the CLI session until the
+        # operator poked). No callback wired = the historical drop semantics.
+        self._on_unsolicited_result = on_unsolicited_result
+        self._unsolicited_text: list[str] = []
+        self._unsolicited_delivered: set[str] = set()
 
     # ---------- lifecycle ----------
 
@@ -741,25 +751,84 @@ class ClaudeAgentSdkSession:
         """Route a message that arrived with no turn in flight.
 
         These are real CLI output (typically a finished background Agent task
-        reporting in), but they answer nothing Hermes asked, so they must
-        never enter a turn's result."""
+        reporting in). They answer nothing Hermes asked, so they must never
+        enter a turn's result — but their CONTENT is completed work the user
+        is waiting on: with a delivery callback wired, capture the top-level
+        assistant text and hand the assembled answer over on the terminal
+        ResultMessage (uuid-deduped). Without a callback, the historical
+        WARN-drop stands."""
         if isinstance(message, _StreamEnd):
             return
         sid = getattr(message, "session_id", None)
         if sid:
             self._session_id = sid
-        if type(message).__name__ == "ResultMessage":
+        name = type(message).__name__
+        if name == "ResultMessage":
             self._unsolicited_results += 1
-            logger.warning(
-                "claude-agent-sdk: dropped unsolicited ResultMessage (no turn "
-                "in flight, total=%d) — CLI-initiated turn; see "
-                "dasbrow-hermes-coder#2",
-                self._unsolicited_results,
+            if self._on_unsolicited_result is None:
+                self._unsolicited_text.clear()
+                logger.warning(
+                    "claude-agent-sdk: dropped unsolicited ResultMessage (no "
+                    "turn in flight, total=%d) — CLI-initiated turn; see "
+                    "dasbrow-hermes-coder#2",
+                    self._unsolicited_results,
+                )
+                return
+            uuid = getattr(message, "uuid", None)
+            if uuid and uuid in self._unsolicited_delivered:
+                self._unsolicited_text.clear()
+                logger.debug(
+                    "claude-agent-sdk: duplicate unsolicited ResultMessage "
+                    "%s ignored", uuid,
+                )
+                return
+            result_text = getattr(message, "result", None)
+            text = (
+                result_text
+                if isinstance(result_text, str) and result_text.strip()
+                else "\n".join(self._unsolicited_text).strip()
+            )
+            self._unsolicited_text.clear()
+            if uuid:
+                self._unsolicited_delivered.add(uuid)
+            if not text:
+                logger.warning(
+                    "claude-agent-sdk: unsolicited ResultMessage carried no "
+                    "text (total=%d) — nothing to deliver",
+                    self._unsolicited_results,
+                )
+                return
+            logger.info(
+                "claude-agent-sdk: delivering unsolicited result (background "
+                "task finished, total=%d, %d chars)",
+                self._unsolicited_results, len(text),
+            )
+            try:
+                self._on_unsolicited_result(text)
+            except Exception:
+                logger.warning(
+                    "claude-agent-sdk: unsolicited-result delivery callback "
+                    "raised — answer may be lost", exc_info=True,
+                )
+        elif name == "AssistantMessage":
+            # Buffer top-level text as the fallback answer body; subagent
+            # streams (parent_tool_use_id set) are noise — the same gate
+            # _forward_stream_delta uses.
+            if (
+                self._on_unsolicited_result is not None
+                and not getattr(message, "parent_tool_use_id", None)
+            ):
+                for block in getattr(message, "content", None) or []:
+                    if type(block).__name__ == "TextBlock":
+                        block_text = getattr(block, "text", "") or ""
+                        if block_text:
+                            self._unsolicited_text.append(block_text)
+            logger.info(
+                "claude-agent-sdk: unsolicited %s outside a turn", name,
             )
         else:
             logger.debug(
-                "claude-agent-sdk: unsolicited %s outside a turn",
-                type(message).__name__,
+                "claude-agent-sdk: unsolicited %s outside a turn", name,
             )
 
     def _start_reader(self) -> None:
