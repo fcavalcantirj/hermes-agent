@@ -603,6 +603,17 @@ def run_claude_agent_sdk_turn(
 
                     from tools.process_registry import process_registry
 
+                    # Directive header, learned live (2026-07-29): the shared
+                    # completion template is permissive ("you may have moved
+                    # on"), and a long-context model answered it with a
+                    # ritual "No response requested." twice while finished
+                    # renders sat on disk. The user IS waiting — say so, and
+                    # keep MEDIA: attachment lines relayable verbatim.
+                    text = (
+                        "[USER IS WAITING: relay this finished result to the "
+                        "user as your reply NOW — include any MEDIA: lines "
+                        "verbatim so attachments send.]\n\n" + text
+                    )
                     now = _time.time()
                     process_registry.completion_queue.put({
                         "type": "async_delegation",
