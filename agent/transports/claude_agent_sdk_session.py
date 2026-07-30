@@ -934,6 +934,11 @@ class ClaudeAgentSdkSession:
             "max_budget_usd": self._max_budget_usd,
             "can_use_tool": can_use_tool,
             "env": env_overrides,
+            # SDK stdout-buffer cap. The default 1 MiB chokes on ballooned-
+            # session resume replays and fat MCP tool results (rafnet hot-fix
+            # 2026-07-19, running patched in production since; SDK 0.2.120
+            # honors the option). 10 MiB is a bound, not an allocation.
+            "max_buffer_size": 10 * 1024 * 1024,
             # Explicit SDK isolation. None (the SDK default, verified against
             # claude-agent-sdk 0.2.120) means the CLI loads ALL filesystem
             # settings — ~/.claude/settings.json, .claude/settings.json,
