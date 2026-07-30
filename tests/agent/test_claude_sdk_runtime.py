@@ -2439,3 +2439,15 @@ class TestBackgroundDeliveryWiring:
             messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
         )
         assert captured.get("on_unsolicited_result") is None
+
+
+class TestSdkBufferCap:
+    def test_options_carry_10mib_max_buffer_size(self):
+        # rafnet production hot-fix 2026-07-19: SDK default 1 MiB stdout
+        # buffer chokes on ballooned resume replays / fat MCP tool results.
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            session.run_turn("ping")
+        finally:
+            session.close()
+        assert holder["client"].options["max_buffer_size"] == 10 * 1024 * 1024
