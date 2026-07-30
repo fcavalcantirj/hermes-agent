@@ -2409,7 +2409,12 @@ class TestBackgroundDeliveryWiring:
         evt = events[0]
         assert evt["type"] == "async_delegation"
         assert evt["status"] == "completed"
-        assert evt["summary"] == "background answer text"
+        # Directive header rides in front of the raw answer so the
+        # completion turn relays instead of shrugging ("No response
+        # requested." — observed live, twice, with renders on disk).
+        assert evt["summary"].endswith("background answer text")
+        assert evt["summary"].startswith("[USER IS WAITING")
+        assert "MEDIA:" in evt["summary"]
         assert evt["session_key"] == "gw-key-7"
         assert evt["parent_session_id"] == "sess-bg-1"
         assert evt["delegation_id"] == ""
