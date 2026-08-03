@@ -77,11 +77,22 @@ def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
         # only trigram statements error, everything else runs for real.
         base = kwargs.get("factory", sqlite3.Connection)
 
+        class _ProbeErrorCursor(sqlite3.Cursor):
+            def execute(self, sql, *a, **k):
+                if isinstance(sql, str) and "messages_fts_trigram" in sql:
+                    raise sqlite3.OperationalError(message)
+                return super().execute(sql, *a, **k)
+
         class _ProbeErrorConnection(base):
             def execute(self, sql, *a, **k):
                 if isinstance(sql, str) and "messages_fts_trigram" in sql:
                     raise sqlite3.OperationalError(message)
                 return super().execute(sql, *a, **k)
+
+            def cursor(self, factory=_ProbeErrorCursor):
+                # The RO-open probe goes through cursor().execute — the
+                # connection-level override alone never sees it.
+                return super().cursor(factory)
 
         kwargs["factory"] = _ProbeErrorConnection
         return real_connect(*args, **kwargs)
