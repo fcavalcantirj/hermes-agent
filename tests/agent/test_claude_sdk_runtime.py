@@ -2451,12 +2451,185 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.reset_current_session_key(token)
 
-    def test_no_registered_notify_denies(self, monkeypatch):
+    def test_no_registered_notify_denies(self, monkeypatch, caplog):
+        # UPDATED (W8): this test used to pin the bare-"deny" return — which
+        # the SDK layer translated to "denied by user" for a prompt no user
+        # ever saw, with no log line (the 2026-08-06 incident's approval
+        # face). The no-approver deny is now structured with an honest
+        # reason and logged at WARNING.
         approval_mod, token = self._gateway_ctx(monkeypatch, "sess-no-notify")
         try:
             cb = approval_mod.build_sdk_gateway_approval_callback()
-            assert cb("Bash(ls)", "Claude requests tool Bash") == "deny"
+            with caplog.at_level(logging.WARNING, logger="tools.approval"):
+                result = cb("Bash(ls)", "Claude requests tool Bash")
+            assert result == {
+                "choice": "deny",
+                "reason": "no approver available (background context)",
+            }
+            assert any(
+                "NO approver available" in r.getMessage()
+                and "Bash(ls)" in r.getMessage()
+                and "sess-no-notify" in r.getMessage()
+                for r in caplog.records
+            ), "the silent deny must not stay silent"
         finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_background_turn_pages_operator_via_session_scoped_approver(
+        self, monkeypatch,
+    ):
+        # The incident lane: deliver_background_results expects CLI-initiated
+        # turns BETWEEN hermes turns — exactly when the turn-scoped
+        # registration is gone. The session-scoped entry (refreshed by every
+        # gateway turn, surviving its teardown) keeps a paging path alive.
+        sk = "sess-bg-approver"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            notify, seen = self._resolve_with(approval_mod, sk, "once")
+            # The gateway turn registers both; then the turn ends.
+            approval_mod.register_gateway_notify(sk, notify)
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.unregister_gateway_notify(sk)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert cb("Bash(ls)", "Claude requests tool Bash") == "once"
+                assert len(seen) == 1  # the operator WAS paged
+                assert seen[0]["command"] == "Bash(ls)"
+            finally:
+                approval_mod.unregister_session_notify(sk)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_no_approver_deny_is_not_attributed_to_user(
+        self, monkeypatch, caplog,
+    ):
+        # End to end across the widened channel: bridge (no approver) →
+        # _make_can_use_tool → PermissionResultDeny carrying the honest
+        # reason. "denied by user" is reserved for the plain user-deny path.
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-bg-honest")
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            session, _ = _make_session(
+                approval_callback=cb, permission_mode="default"
+            )
+            fn = session._make_can_use_tool()
+            with caplog.at_level(logging.WARNING, logger="tools.approval"):
+                res = asyncio.run(fn("Bash", {"command": "ls"}, None))
+            assert type(res).__name__ == "PermissionResultDeny"
+            assert res.message == "no approver available (background context)"
+            assert "denied by user" not in res.message
+            assert any(
+                "NO approver available" in r.getMessage()
+                for r in caplog.records
+            )
+
+            # Back-compat: plain string returns keep their classic mapping.
+            session2, _ = _make_session(
+                approval_callback=lambda *a, **k: "deny",
+                permission_mode="default",
+            )
+            res2 = asyncio.run(session2._make_can_use_tool()("Bash", {}, None))
+            assert res2.message == "denied by user"
+            session3, _ = _make_session(
+                approval_callback=lambda *a, **k: "once",
+                permission_mode="default",
+            )
+            res3 = asyncio.run(session3._make_can_use_tool()("Bash", {}, None))
+            assert type(res3).__name__ == "PermissionResultAllow"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_session_scoped_entry_lifecycle(self, monkeypatch):
+        # Leak guard: the entry survives turn teardown (the feature), dies at
+        # the conversation boundary (clear_session — the gateway's boundary
+        # funnel) and at shutdown (clear_all_session_notify); re-register is
+        # idempotent.
+        sk = "sess-lifecycle"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            notify, _ = self._resolve_with(approval_mod, sk, "once")
+            approval_mod.register_gateway_notify(sk, notify)
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.unregister_gateway_notify(sk)
+            assert sk in approval_mod._session_notify_cbs  # survives the turn
+
+            # Idempotent refresh: latest cb wins, still a single entry.
+            def other(_data):
+                pass
+
+            approval_mod.register_session_notify(sk, other)
+            assert approval_mod._session_notify_cbs[sk] is other
+
+            # Conversation boundary removes it; the bridge then denies
+            # honestly instead of paging a rotated-away session.
+            approval_mod.clear_session(sk)
+            assert sk not in approval_mod._session_notify_cbs
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            result = cb("Bash(ls)", "desc")
+            assert result["reason"] == "no approver available (background context)"
+
+            # Unknown-key unregister is a no-op; clear-all empties.
+            approval_mod.unregister_session_notify("never-registered")
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.clear_all_session_notify()
+            assert approval_mod._session_notify_cbs == {}
+        finally:
+            approval_mod.unregister_session_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_unanswered_and_failed_prompts_carry_honest_reasons(
+        self, monkeypatch,
+    ):
+        # The model must never hear "denied by user" for a prompt no user
+        # answered: timeout, notify-failure and /deny <reason> each carry
+        # their own truth.
+        sk = "sess-honest-reasons"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+
+            # Timeout: the operator was paged but never answered.
+            monkeypatch.setattr(
+                approval_mod, "_get_approval_timeout", lambda: 0.0
+            )
+            paged = []
+            approval_mod.register_session_notify(sk, paged.append)
+            result = cb("Bash(sleep)", "desc")
+            assert result == {
+                "choice": "deny",
+                "reason": "approval timed out — no operator response",
+            }
+            assert len(paged) == 1
+
+            # Notify failure: the prompt never reached the operator.
+            def broken(_data):
+                raise RuntimeError("adapter send failed")
+
+            approval_mod.register_session_notify(sk, broken)
+            result = cb("Bash(x)", "desc")
+            assert result["choice"] == "deny"
+            assert "notify failed" in result["reason"]
+            assert "denied by user" not in result["reason"]
+
+            # /deny <reason>: a REAL user deny — attributed, in their words.
+            # Restore a sane timeout: the 0.0 above would hit the deadline
+            # break before the wait ever observes the (already-set) event.
+            monkeypatch.setattr(
+                approval_mod, "_get_approval_timeout", lambda: 5.0
+            )
+
+            def deny_with_reason(_data):
+                approval_mod.resolve_gateway_approval(
+                    sk, "deny", reason="not now"
+                )
+
+            approval_mod.register_session_notify(sk, deny_with_reason)
+            result = cb("Bash(y)", "desc")
+            assert result == {
+                "choice": "deny", "reason": "denied by user: not now",
+            }
+        finally:
+            approval_mod.unregister_session_notify(sk)
             approval_mod.reset_current_session_key(token)
 
     def _resolve_with(self, approval_mod, session_key, choice):

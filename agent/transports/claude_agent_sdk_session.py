@@ -1039,7 +1039,7 @@ class ClaudeAgentSdkSession:
             )
 
             try:
-                choice = await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     approval_callback,
                     f"{tool_name}({_tool_preview(tool_name, tool_input)})",
                     f"Claude requests tool {tool_name}",
@@ -1048,9 +1048,19 @@ class ClaudeAgentSdkSession:
             except Exception:
                 logger.exception("approval_callback raised on SDK permission")
                 return PermissionResultDeny(message="approval callback failed")
+            # Widened callback contract: a plain choice string, or a dict
+            # {"choice": str, "reason": str} carrying an honest deny reason
+            # (no-approver / timeout / notify-failure). "denied by user" is
+            # reserved for a real human deny — a reason-bearing deny must
+            # never be attributed to the user.
+            reason = None
+            choice = result
+            if isinstance(result, dict):
+                reason = result.get("reason")
+                choice = result.get("choice")
             if choice in ("once", "session", "always"):
                 return PermissionResultAllow()
-            return PermissionResultDeny(message="denied by user")
+            return PermissionResultDeny(message=reason or "denied by user")
 
         return _can_use_tool
 

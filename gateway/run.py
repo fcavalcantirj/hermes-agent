@@ -5015,6 +5015,7 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            register_session_notify,
             reset_current_session_key,
             set_current_session_key,
             unregister_gateway_notify,
@@ -5257,6 +5258,13 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        # Session-scoped refresh: unlike the turn registration above, this
+        # entry SURVIVES the finally-unregister, so a CLI-initiated
+        # background SDK turn between hermes turns can still page the
+        # operator (the closure is session-stable: adapter, chat id and
+        # loop all outlive the turn). Removed at conversation boundaries
+        # (clear_session via the boundary funnel) and gateway shutdown.
+        register_session_notify(_approval_session_key, _approval_notify_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -12836,6 +12844,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            # Session-scoped approval notify callbacks close over adapters
+            # and the loop being torn down below — a retained entry would
+            # page dead sessions on the next start-in-process (restart).
+            try:
+                from tools.approval import clear_all_session_notify
+
+                clear_all_session_notify()
+            except Exception:
+                logger.debug(
+                    "clear_all_session_notify failed during shutdown",
+                    exc_info=True,
+                )
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)

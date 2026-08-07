@@ -2308,6 +2308,16 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# Session-scoped notify registry: SURVIVES turn teardown, so a CLI-initiated
+# background SDK turn between hermes turns can still page the operator (the
+# 2026-08-06 incident lane: notify_cb None → silent deny falsely attributed
+# to the user). Populated ONLY by the hermes gateway's turn registration
+# (gateway/run.py) — NOT folded into register_gateway_notify, because the
+# api_server per-run and tui_gateway per-session callers key differently and
+# a blanket refresh would leak dead run_id/session_id entries. Removed at
+# conversation boundaries (clear_session, via the gateway's boundary funnel)
+# and gateway shutdown (clear_all_session_notify).
+_session_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2327,12 +2337,47 @@ def unregister_gateway_notify(session_key: str) -> None:
 
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
+
+    Deliberately does NOT remove the session-scoped entry
+    (``_session_notify_cbs``): turn teardown is exactly the moment the
+    session-scoped approver starts mattering — background SDK prompts fire
+    between turns.
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+
+
+def register_session_notify(session_key: str, cb) -> None:
+    """Register/refresh the SESSION-scoped approval notify callback.
+
+    Idempotent — the gateway calls this on every turn alongside
+    ``register_gateway_notify``; the latest callback wins. The callback must
+    stay valid between turns (the gateway's closure is: adapter, chat id and
+    event loop all outlive the turn).
+    """
+    if not session_key:
+        return
+    with _lock:
+        _session_notify_cbs[session_key] = cb
+
+
+def unregister_session_notify(session_key: str) -> None:
+    """Remove the session-scoped approval notify callback (idempotent).
+
+    Touches ONLY the session-scoped registry — never the turn registry or
+    the pending-approval queues.
+    """
+    with _lock:
+        _session_notify_cbs.pop(session_key, None)
+
+
+def clear_all_session_notify() -> None:
+    """Drop every session-scoped notify callback (gateway shutdown)."""
+    with _lock:
+        _session_notify_cbs.clear()
 
 
 def build_sdk_gateway_approval_callback():
@@ -2376,14 +2421,37 @@ def build_sdk_gateway_approval_callback():
         return None
 
     def _sdk_gateway_approval(command: str, description: str, *,
-                              allow_permanent: bool = False) -> str:
+                              allow_permanent: bool = False):
+        # Widened return channel (plan-of-record): a plain choice string
+        # ("once"/"deny") for the classic outcomes, or a dict
+        # {"choice": str, "reason": str} when the deny needs an HONEST
+        # reason. The SDK session's _make_can_use_tool normalizes both;
+        # "denied by user" is reserved for a human actually choosing deny —
+        # timeout, no-approver and notify-failure each carry their own
+        # reason (the model used to hear "denied by user" for prompts no
+        # user ever saw — 2026-08-06 incident).
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            # Turn registration wins; the session-scoped entry is the
+            # between-turns fallback that lets a background SDK turn page
+            # the operator.
+            notify_cb = (
+                _gateway_notify_cbs.get(session_key)
+                or _session_notify_cbs.get(session_key)
+            )
         if notify_cb is None:
-            # No live turn registration (gateway tearing down, or the warm
-            # session outlived its turn): fail closed, exactly like the SDK
-            # would without a bridge.
-            return "deny"
+            # No approver anywhere (background context with no session
+            # registration, or gateway tearing down): fail closed, but say
+            # so honestly — never attribute this deny to the user.
+            logger.warning(
+                "SDK approval request has NO approver available "
+                "(background context): tool=%s session=%s — denying "
+                "without user attribution",
+                command, session_key,
+            )
+            return {
+                "choice": "deny",
+                "reason": "no approver available (background context)",
+            }
         approval_data = {
             "command": command,
             "pattern_key": "claude_sdk_tool",
@@ -2398,7 +2466,31 @@ def build_sdk_gateway_approval_callback():
         decision = _await_gateway_decision(
             session_key, notify_cb, approval_data, surface="claude_sdk"
         )
-        if not decision.get("resolved") or decision.get("choice") in (None, "deny"):
+        if decision.get("notify_failed"):
+            return {
+                "choice": "deny",
+                "reason": "approval request could not be delivered to the "
+                          "operator (notify failed)",
+            }
+        if not decision.get("resolved"):
+            # The operator saw the prompt (notify succeeded) but never
+            # answered within the approval timeout.
+            return {
+                "choice": "deny",
+                "reason": "approval timed out — no operator response",
+            }
+        choice = decision.get("choice")
+        if choice is None:
+            # Turn teardown resolved the wait without a result. Existing
+            # behavior (plain deny → "denied by user") KEPT verbatim —
+            # teardown-as-expired semantics are W11's item, not this one.
+            return "deny"
+        if choice == "deny":
+            reason = decision.get("reason")
+            if reason:
+                # /deny <reason>: still a real user deny — attribute it,
+                # and relay the operator's words.
+                return {"choice": "deny", "reason": f"denied by user: {reason}"}
             return "deny"
         # Clamp durable choices to one-shot: an older client button can
         # still send "session"/"always"; the grant must not outlive the
@@ -2508,6 +2600,11 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        # Conversation boundary (/new, expiry, auto-reset, …): the
+        # session-scoped approver dies with the conversation — the next
+        # turn's registration refreshes it. A retained entry would page the
+        # operator for a session the user deliberately rotated away.
+        _session_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
