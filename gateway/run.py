@@ -21829,6 +21829,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    _SELF_ECHO_TAIL_ROWS = 30
+
+    async def _self_echo_guard_redirect(self, evt: dict) -> bool:
+        """Belt-and-braces for the surviving re-injection lane.
+
+        The direct sdk_background_result lane cannot echo by construction;
+        genuine delegations still deliver by injecting a synthetic turn into
+        the parent session — a payload identical to that session's own
+        recent assistant text would recreate the 2026-08-06 self-echo (the
+        model recognizes its own words and refuses to relay them).
+
+        Returns True when the completion's raw payload matched the parent
+        session's recent assistant tail and was redirected to the direct
+        outbound lane instead — that redirect IS delivery, so the caller's
+        acceptance bookkeeping (durable claim completed, never released)
+        must run exactly as for an accepted injection. Returns False to
+        inject normally; fails OPEN on any read error — this is a guard,
+        not a delivery gate.
+        """
+        if evt.get("type") != "async_delegation":
+            return False
+        summary = evt.get("summary")
+        parent = str(evt.get("parent_session_id") or "").strip()
+        if not isinstance(summary, str) or not summary.strip() or not parent:
+            return False
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return False
+
+        def _norm(text: str) -> str:
+            return " ".join(text.split())
+
+        try:
+            session = await db.get_session(parent)
+            if not session:
+                return False
+            count = int(session.get("message_count") or 0)
+            rows = await db.get_messages(
+                parent,
+                limit=self._SELF_ECHO_TAIL_ROWS,
+                offset=max(0, count - self._SELF_ECHO_TAIL_ROWS),
+            )
+            target = _norm(summary)
+            matched = any(
+                row.get("role") == "assistant"
+                and isinstance(row.get("content"), str)
+                and _norm(row["content"]) == target
+                for row in rows or []
+            )
+        except Exception:
+            logger.debug(
+                "self-echo guard read failed for session %s — failing open "
+                "to normal injection", parent, exc_info=True,
+            )
+            return False
+        if not matched:
+            return False
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put({
+                "type": "sdk_background_result",
+                "payloads": [summary],
+                "session_key": str(evt.get("session_key") or ""),
+                "parent_session_id": parent,
+                "model": evt.get("model"),
+                "dispatched_at": evt.get("dispatched_at"),
+                "completed_at": evt.get("completed_at"),
+                # The payload IS the session's own recent assistant text —
+                # it already lives in the transcript; re-projecting would
+                # write a duplicate row.
+                "_projected": True,
+            })
+        except Exception:
+            logger.warning(
+                "self-echo guard matched delegation %s but redirect enqueue "
+                "failed — falling back to normal injection",
+                evt.get("delegation_id"), exc_info=True,
+            )
+            return False
+        logger.warning(
+            "self-echo guard: delegation %s payload is identical to recent "
+            "assistant text of session %s — injection skipped, payload "
+            "redirected to the direct outbound lane",
+            evt.get("delegation_id"), parent,
+        )
+        return True
+
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -21914,9 +22002,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
-                return injection_result
+            if await self._self_echo_guard_redirect(evt):
+                # Redirected to the direct outbound lane — this IS delivery;
+                # flow through the same acceptance tail so the durable claim
+                # is completed, never released as a failure.
+                pass
+            else:
+                injection_result = await self._inject_watch_notification(synth_text, evt)
+                if injection_result is not True:
+                    return injection_result
             accepted = True
 
             if identity is not None:
