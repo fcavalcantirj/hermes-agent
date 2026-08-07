@@ -12,11 +12,12 @@ retire the client rather than silently continue.
 
 import asyncio
 import logging
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -2405,6 +2406,34 @@ class TestFatalReason:
         assert "failure_reason" not in result
 
 
+# ---------- SDK permission-result stand-ins (planted as the module) ----------
+# _make_can_use_tool lazy-imports PermissionResultAllow/Deny from
+# claude_agent_sdk at CALL time — the only import of the real SDK package any
+# test in this file can reach. Upstream CI installs no claude-agent-sdk
+# extra, so tests that INVOKE the callback must plant a stand-in module
+# first (the header's contract: stand-in classes named like the SDK's
+# types). Planted unconditionally: the tests exercise identical code
+# whether or not the real SDK is installed.
+
+
+class PermissionResultAllow:
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
+
+
+class PermissionResultDeny:
+    def __init__(self, message: str = "", **kwargs: Any) -> None:
+        self.message = message
+        self.__dict__.update(kwargs)
+
+
+def _plant_claude_agent_sdk_stand_in(monkeypatch) -> None:
+    module = ModuleType("claude_agent_sdk")
+    module.PermissionResultAllow = PermissionResultAllow
+    module.PermissionResultDeny = PermissionResultDeny
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+
+
 # ---------- gateway approval bridge: SDK permission prompts reach the chat ----------
 # Production finding (dasbrow 24/7 box): under the gateway, _create_session's
 # thread-local CLI callback is always None, so mode=default wired
@@ -2415,6 +2444,10 @@ class TestFatalReason:
 
 
 class TestGatewayApprovalBridge:
+    @pytest.fixture(autouse=True)
+    def _sdk_permission_results(self, monkeypatch):
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
+
     def _gateway_ctx(self, monkeypatch, session_key):
         from tools import approval as approval_mod
 
