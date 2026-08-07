@@ -599,6 +599,9 @@ def run_claude_agent_sdk_turn(
         from agent.transports.claude_agent_sdk_session import _provider_flag
 
         if _provider_flag("deliver_background_results", default=False):
+            # Creation-time snapshots survive as FALLBACKS only — the SDK
+            # session outlives hermes session rotations, so anything read
+            # here can be stale by the time a background completion fires.
             try:
                 from tools.approval import get_current_session_key
 
@@ -615,6 +618,29 @@ def run_claude_agent_sdk_turn(
                 # the model recognized its own text, refused to "relay" it,
                 # and the report never left the box). The watcher delivers
                 # each payload as its own outbound message, in order.
+                #
+                # Parent/route are resolved AT DELIVERY TIME: a completion
+                # firing after a hermes session rotation must carry the LIVE
+                # session id, not the creation-time snapshot — the gateway
+                # classifies a rotated-away parent as permanently gone and
+                # drops the delivery.
+                try:
+                    from tools.approval import (
+                        get_current_session_key as _live_key_fn,
+                    )
+
+                    _live_key = _live_key_fn() or ""
+                except Exception:
+                    _live_key = ""
+                # This callback fires on the SDK loop thread, where the
+                # get_current_session_key contextvar may be unset — an empty
+                # live read falls back to the creation-time snapshot rather
+                # than losing the route.
+                session_key = _live_key or _bg_session_key
+                parent_session_id = (
+                    getattr(agent, "session_id", None) or _bg_parent_session_id
+                )
+                model = getattr(agent, "model", None) or _bg_model
                 try:
                     import time as _time
 
@@ -624,9 +650,9 @@ def run_claude_agent_sdk_turn(
                     process_registry.completion_queue.put({
                         "type": "sdk_background_result",
                         "payloads": list(texts),
-                        "session_key": _bg_session_key,
-                        "parent_session_id": _bg_parent_session_id,
-                        "model": _bg_model,
+                        "session_key": session_key,
+                        "parent_session_id": parent_session_id,
+                        "model": model,
                         "dispatched_at": now,
                         "completed_at": now,
                     })

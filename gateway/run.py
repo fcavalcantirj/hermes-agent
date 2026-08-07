@@ -21964,6 +21964,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "delegation records).",
                         durable_delegation_id or "<legacy>", parent_session_id,
                     )
+                    # The drop is deliberate — a rotated-away session can be
+                    # a deliberate user statement (/new), so no auto-send to
+                    # a last-known route — but the PAYLOAD itself must
+                    # survive: for legacy/id-less events the queue copy was
+                    # the ONLY copy. Project it into the transcript when the
+                    # db can take it, else write an orphaned-results file.
+                    _summary = evt.get("summary")
+                    if isinstance(_summary, str) and _summary.strip():
+                        _projected_terminal = False
+                        _db = getattr(self, "_session_db", None)
+                        if _db is not None:
+                            try:
+                                await _db.append_message(
+                                    session_id=parent_session_id,
+                                    role="assistant",
+                                    content=_summary,
+                                    display_kind="sdk_background_result",
+                                    display_metadata={
+                                        "orphaned": "terminal_drop",
+                                        "delegation_id":
+                                            durable_delegation_id or None,
+                                        "completed_at": evt.get("completed_at"),
+                                    },
+                                )
+                                _projected_terminal = True
+                            except Exception:
+                                logger.debug(
+                                    "terminal-drop transcript projection "
+                                    "failed for %s", parent_session_id,
+                                    exc_info=True,
+                                )
+                        if not _projected_terminal:
+                            self._persist_orphaned_result_file(
+                                [_summary],
+                                session_id=parent_session_id,
+                                reason="terminal_drop",
+                            )
                     if durable_claim_id:
                         try:
                             from tools.async_delegation import drop_completion_delivery
@@ -22074,6 +22111,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    def _persist_orphaned_result_file(
+        self, payloads: list, *, session_id: Optional[str], reason: str,
+    ) -> Optional[str]:
+        """Last-resort durability for a finished background/delegation payload
+        that can reach neither its transcript nor its recipient (terminal
+        parent drop, projection failure). Writes the payload to
+        ``~/.hermes/orphaned-results/`` so a gateway restart or a terminal
+        drop can never erase the only copy — "nothing finished may ever
+        become unrecoverable again". Returns the file path, or None on
+        failure; never raises (persistence trouble must not block the drop
+        disposition or the delivery attempt).
+        """
+        try:
+            import uuid as _uuid
+
+            out_dir = get_hermes_home() / "orphaned-results"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            safe_session = re.sub(
+                r"[^A-Za-z0-9._-]", "_", str(session_id or "unknown"),
+            )[:80]
+            path = out_dir / (
+                f"{stamp}-{safe_session}-{_uuid.uuid4().hex[:8]}.json"
+            )
+            path.write_text(
+                json.dumps({
+                    "persisted_at": time.time(),
+                    "session_id": session_id,
+                    "reason": reason,
+                    "payloads": [str(p) for p in payloads],
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.warning(
+                "orphaned result persisted to %s (%s, %d payload(s))",
+                path, reason, len(payloads),
+            )
+            return str(path)
+        except Exception:
+            logger.warning(
+                "orphaned-result file persistence failed (%s) — payload "
+                "remains at risk", reason, exc_info=True,
+            )
+            return None
+
     async def _deliver_sdk_background_result(self, evt: dict) -> Optional[bool]:
         """Send a finished claude-agent-sdk background result DIRECTLY on the
         platform outbound lane — never re-injected into the agent session.
@@ -22115,11 +22197,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _db is None or not _parent:
                 logger.warning(
                     "sdk_background_result not projected into transcript "
-                    "(session_db=%s, parent_session_id=%r) — payloads remain "
-                    "queue-only",
+                    "(session_db=%s, parent_session_id=%r) — persisting to "
+                    "orphaned-results",
                     "ok" if _db is not None else None, _parent,
                 )
+                # Queue-only payloads die with a gateway restart — give them
+                # a durable copy before the delivery attempt.
+                self._persist_orphaned_result_file(
+                    payloads,
+                    session_id=_parent or None,
+                    reason="projection_unavailable",
+                )
             else:
+                _unprojected = []
                 for _payload in payloads:
                     try:
                         await _db.append_message(
@@ -22132,11 +22222,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             },
                         )
                     except Exception:
+                        _unprojected.append(_payload)
                         logger.warning(
                             "sdk_background_result transcript projection "
                             "failed for session %s — continuing with "
                             "delivery", _parent, exc_info=True,
                         )
+                if _unprojected:
+                    self._persist_orphaned_result_file(
+                        _unprojected,
+                        session_id=_parent,
+                        reason="projection_failed",
+                    )
         source = self._build_process_event_source(evt)
         adapter = None
         if source is not None:

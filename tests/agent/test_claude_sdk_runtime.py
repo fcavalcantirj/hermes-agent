@@ -2872,6 +2872,71 @@ class TestBackgroundDeliveryWiring:
         assert evt["parent_session_id"] == "sess-bg-1"
         assert "delegation_id" not in evt
 
+    def test_bg_parent_resolved_at_delivery_time_after_rotation(
+        self, monkeypatch,
+    ):
+        # P0.g: the SDK session outlives hermes session rotations. The old
+        # code snapshotted parent_session_id/session_key at SDK-session
+        # CREATION, so a completion firing after rotation carried the dead
+        # parent — the gateway classified it permanently gone and dropped
+        # it. The callback must resolve the parent AT DELIVERY TIME, with
+        # the creation-time snapshot only as a fallback for the SDK-loop
+        # thread where the session-key contextvar is unset.
+        import hermes_cli.config as cfg
+        from tools.process_registry import process_registry
+
+        captured = self._spy_kwargs(monkeypatch)
+        events = []
+
+        class _FakeQueue:
+            def put(self, evt):
+                events.append(evt)
+
+        monkeypatch.setattr(process_registry, "completion_queue", _FakeQueue())
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: "gw-key-7"
+        )
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"deliver_background_results": True}}
+            },
+            raising=False,
+        )
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent.session_id = "sess-before"
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        callback = captured.get("on_unsolicited_result")
+        assert callback is not None
+
+        # Hermes rotates the session between turns; the completion fires on
+        # the SDK loop thread where the contextvar reads empty.
+        agent.session_id = "sess-after-rotation"
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: ""
+        )
+        callback(["late background report"])
+        assert len(events) == 1
+        assert events[0]["parent_session_id"] == "sess-after-rotation"
+        # Empty live key -> creation-time snapshot fallback keeps the route.
+        assert events[0]["session_key"] == "gw-key-7"
+
+        # A live, non-empty contextvar read wins over the snapshot.
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: "gw-key-LIVE"
+        )
+        callback(["second late report"])
+        assert len(events) == 2
+        assert events[1]["session_key"] == "gw-key-LIVE"
+        assert events[1]["parent_session_id"] == "sess-after-rotation"
+
     def test_flag_off_leaves_callback_unwired(self, monkeypatch):
         import hermes_cli.config as cfg
 

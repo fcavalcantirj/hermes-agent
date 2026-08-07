@@ -244,3 +244,58 @@ def test_post_turn_drain_leaves_sdk_background_result_on_queue():
     while not q.empty():
         remaining.append(q.get_nowait())
     assert remaining == [evt]
+
+
+def test_projection_failure_writes_fallback_file_and_delivery_proceeds(
+    monkeypatch, tmp_path,
+):
+    # P0.g: when the transcript projection is unavailable (no session_db /
+    # no parent) or fails, the payload previously lived ONLY in the
+    # in-memory queue — a gateway restart erased it. It must gain a durable
+    # copy under ~/.hermes/orphaned-results/ while the delivery attempt
+    # proceeds unchanged.
+    import json as _json
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # Branch A: session_db unavailable.
+    adapter = _adapter()
+    runner = _runner(adapter)
+    runner._session_db = None
+    evt = _event()
+    assert asyncio.run(runner._deliver_sdk_background_result(evt)) is True
+    assert adapter.send.call_count == 2  # delivery proceeded
+    files = sorted((tmp_path / "orphaned-results").glob("*.json"))
+    assert len(files) == 1
+    data = _json.loads(files[0].read_text(encoding="utf-8"))
+    assert data["payloads"] == [
+        "Research landed — writing up.", "the full report",
+    ]
+    assert data["reason"] == "projection_unavailable"
+    assert data["session_id"] == "sess-bg-1"
+
+    # A requeue-style retry of the SAME event never double-writes
+    # (_projected is stamped once per event lifetime).
+    assert asyncio.run(runner._deliver_sdk_background_result(evt)) is True
+    assert len(list((tmp_path / "orphaned-results").glob("*.json"))) == 1
+
+    # Branch B: db present but every append fails.
+    adapter_b = _adapter()
+    runner_b = _runner(adapter_b)
+    runner_b._session_db = SimpleNamespace(
+        append_message=AsyncMock(side_effect=RuntimeError("db locked"))
+    )
+    evt_b = _event(payloads=["only payload"])
+    assert asyncio.run(runner_b._deliver_sdk_background_result(evt_b)) is True
+    assert adapter_b.send.call_count == 1
+    files = sorted((tmp_path / "orphaned-results").glob("*.json"))
+    assert len(files) == 2
+    newest = [
+        f for f in files
+        if _json.loads(f.read_text(encoding="utf-8"))["reason"]
+        == "projection_failed"
+    ]
+    assert len(newest) == 1
+    assert _json.loads(newest[0].read_text(encoding="utf-8"))["payloads"] == [
+        "only payload"
+    ]
