@@ -205,6 +205,51 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.mark.asyncio
+    async def test_card_maps_tool_use_id_and_tap_resolves_by_id(self):
+        """P2.a: the SDK prompt correlator rides the adapter-side map
+        (callback_data is capped at 64 bytes and stays byte-identical), and
+        the tap resolves by tool_use_id — not queue[0], killing the
+        tap-B-grants-A misroute on parallel prompts."""
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 42
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command="Bash(uname)",
+            session_key="agent:main:telegram:group:12345:99",
+            tool_use_id="toolu_01XYZ",
+        )
+        assert result.success is True
+        (approval_id, entry), = adapter._approval_state.items()
+        assert entry == ("agent:main:telegram:group:12345:99", "toolu_01XYZ")
+
+        query = AsyncMock()
+        query.data = f"ea:once:{approval_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.first_name = "Norbert"
+        query.from_user.id = "12345"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_gateway_approval", return_value=1
+            ) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99", "once",
+            tool_use_id="toolu_01XYZ",
+        )
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):

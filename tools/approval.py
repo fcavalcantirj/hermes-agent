@@ -2460,7 +2460,8 @@ def build_sdk_gateway_approval_callback(context_provider=None):
     _build_key = get_current_session_key("")
 
     def _sdk_gateway_approval(command: str, description: str, *,
-                              allow_permanent: bool = False):
+                              allow_permanent: bool = False,
+                              tool_use_id: str = ""):
         # Widened return channel (plan-of-record): a plain choice string
         # ("once"/"deny") for the classic outcomes, or a dict
         # {"choice": str, "reason": str} when the deny needs an HONEST
@@ -2526,6 +2527,10 @@ def build_sdk_gateway_approval_callback(context_provider=None):
             # where they are auditable — not in chat-tap persistence.
             "allow_permanent": False,
             "allow_session": False,
+            # P2.a correlator: rides onto the pending _ApprovalEntry
+            # (entry.data IS this dict) so a button tap can resolve the
+            # MATCHING prompt instead of queue[0].
+            "tool_use_id": tool_use_id or "",
         }
         decision = _await_gateway_decision(
             session_key, notify_cb, approval_data, surface="claude_sdk"
@@ -2561,12 +2566,17 @@ def build_sdk_gateway_approval_callback(context_provider=None):
         # single SDK permission request it answered.
         return "once"
 
+    # Marker for the SDK session layer: this callback accepts the
+    # tool_use_id kwarg (the CLI thread-local callback does not — the
+    # session only passes the correlator to callbacks that opt in).
+    _sdk_gateway_approval._accepts_tool_use_id = True
     return _sdk_gateway_approval
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             tool_use_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2578,8 +2588,18 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
+    *tool_use_id* (P2.a): when the resolution carries the SDK's prompt
+    correlator, ONLY the matching pending entry resolves — with parallel
+    prompts, FIFO let tapping prompt B's button grant prompt A. A carried
+    id that matches nothing pending (already resolved/expired) resolves
+    ZERO entries, never queue[0]. Id-less resolutions (text /approve,
+    stale pre-deploy buttons, non-SDK surfaces) keep FIFO, and every
+    single-pop FIFO fallback is logged — that log line is the only
+    observability left for the misroute class this correlator kills.
+
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    fifo_fallback_pending = 0
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
@@ -2587,10 +2607,26 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if resolve_all:
             targets = list(queue)
             queue.clear()
+        elif tool_use_id:
+            targets = [
+                e for e in queue
+                if e.data.get("tool_use_id") == tool_use_id
+            ][:1]
+            if not targets:
+                return 0
+            queue.remove(targets[0])
         else:
+            fifo_fallback_pending = len(queue)
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
+    if fifo_fallback_pending:
+        logger.info(
+            "Gateway approval resolved by FIFO fallback (no tool_use_id): "
+            "session=%s pending=%d — with parallel prompts this cannot "
+            "distinguish which prompt was answered",
+            session_key, fifo_fallback_pending,
+        )
 
     for entry in targets:
         entry.result = choice

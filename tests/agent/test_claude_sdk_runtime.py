@@ -2703,6 +2703,64 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.unregister_gateway_notify(sk)
 
+    def test_tool_use_id_threads_from_context_to_approval_data(
+        self, monkeypatch,
+    ):
+        # P2.a end to end: context.tool_use_id → callback kwarg (marker
+        # opt-in) → approval_data → the pending entry the button resolves.
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-correlate")
+        try:
+            notify, seen = self._resolve_with(
+                approval_mod, "sess-correlate", "once"
+            )
+            approval_mod.register_gateway_notify("sess-correlate", notify)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert getattr(cb, "_accepts_tool_use_id", False) is True
+                assert cb("Bash(a)", "desc", tool_use_id="toolu_T") == "once"
+                assert seen[0]["tool_use_id"] == "toolu_T"
+            finally:
+                approval_mod.unregister_gateway_notify("sess-correlate")
+
+            # Session layer: a marker-bearing callback receives the SDK
+            # context's id...
+            got = {}
+
+            def marked(command, description, *, allow_permanent=False,
+                       tool_use_id=""):
+                got["tool_use_id"] = tool_use_id
+                return "once"
+
+            marked._accepts_tool_use_id = True
+            session, _ = _make_session(
+                approval_callback=marked, permission_mode="default"
+            )
+            ctx_obj = SimpleNamespace(tool_use_id="toolu_CTX")
+            res = asyncio.run(
+                session._make_can_use_tool()("Bash", {"command": "x"}, ctx_obj)
+            )
+            assert type(res).__name__ == "PermissionResultAllow"
+            assert got["tool_use_id"] == "toolu_CTX"
+
+            # ...and a marker-less (CLI-style) callback keeps its exact
+            # signature — invoked without the kwarg, no TypeError.
+            calls = {}
+
+            def plain(command, description, *, allow_permanent=False):
+                calls["ok"] = True
+                return "deny"
+
+            session2, _ = _make_session(
+                approval_callback=plain, permission_mode="default"
+            )
+            res2 = asyncio.run(
+                session2._make_can_use_tool()("Bash", {}, ctx_obj)
+            )
+            assert calls["ok"] is True
+            assert type(res2).__name__ == "PermissionResultDeny"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
     def test_no_context_deny_is_honest(self, monkeypatch, caplog):
         # A background prompt on a session whose latest turn context is
         # empty (no gateway, no key) must deny with the honest reason —

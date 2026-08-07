@@ -1039,11 +1039,22 @@ class ClaudeAgentSdkSession:
             )
 
             try:
+                kwargs: dict = {"allow_permanent": False}
+                # tool_use_id correlation (P2.a): the SDK guarantees a
+                # non-empty context.tool_use_id — thread it through so a
+                # button tap resolves THIS prompt, not queue[0]. Opt-in via
+                # marker attribute: the CLI thread-local callback keeps its
+                # exact signature (same additive philosophy as the widened
+                # return channel).
+                if getattr(approval_callback, "_accepts_tool_use_id", False):
+                    kwargs["tool_use_id"] = (
+                        getattr(context, "tool_use_id", "") or ""
+                    )
                 result = await asyncio.to_thread(
                     approval_callback,
                     f"{tool_name}({_tool_preview(tool_name, tool_input)})",
                     f"Claude requests tool {tool_name}",
-                    allow_permanent=False,
+                    **kwargs,
                 )
             except Exception:
                 logger.exception("approval_callback raised on SDK permission")

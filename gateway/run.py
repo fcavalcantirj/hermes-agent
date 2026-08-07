@@ -5054,6 +5054,22 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    # P2.a: hand the SDK prompt correlator to adapters that
+                    # can carry it on the card (signature-guarded — only the
+                    # Telegram adapter accepts it today; the other adapters'
+                    # signatures must not break on an unexpected kwarg).
+                    _sea_extra: Dict[str, Any] = {}
+                    _tuid = approval_data.get("tool_use_id") or ""
+                    if _tuid:
+                        try:
+                            import inspect as _inspect
+
+                            if "tool_use_id" in _inspect.signature(
+                                type(ctx._status_adapter).send_exec_approval
+                            ).parameters:
+                                _sea_extra["tool_use_id"] = _tuid
+                        except (TypeError, ValueError):
+                            pass
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
@@ -5064,6 +5080,7 @@ class TurnRunner:
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
+                            **_sea_extra,
                         ),
                         ctx._loop_for_step,
                         logger=logger,
