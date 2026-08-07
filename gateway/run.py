@@ -3308,7 +3308,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "sdk_background_result"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -21972,6 +21972,134 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _deliver_sdk_background_result(self, evt: dict) -> Optional[bool]:
+        """Send a finished claude-agent-sdk background result DIRECTLY on the
+        platform outbound lane — never re-injected into the agent session.
+
+        The old lane wrapped the agent's own answer in a synthetic empty-id
+        delegation and asked the model to relay it; the model recognized its
+        own text, refused, and the answer never left the box (2026-08-06).
+        Each payload goes out as its own agent message, in order.
+
+        ``True`` = every payload sent. ``False`` = retry (caller requeues;
+        already-sent payloads are trimmed off the event first, so the retry
+        delivers only the remainder). ``None`` = empty event, nothing to send.
+        A missing route fails SAFE with ``False`` — the payload is a finished
+        result the user is waiting on; it must never be dropped silently.
+        """
+        payloads = [
+            p for p in (evt.get("payloads") or [])
+            if isinstance(p, str) and p.strip()
+        ]
+        if not payloads:
+            logger.warning(
+                "sdk_background_result event carried no payloads — dropping",
+            )
+            return None
+        source = self._build_process_event_source(evt)
+        adapter = None
+        if source is not None:
+            platform_name = (
+                source.platform.value
+                if hasattr(source.platform, "value")
+                else str(source.platform)
+            )
+            for p, a in self.adapters.items():
+                if p.value == platform_name:
+                    adapter = a
+                    break
+        from gateway.wake import adapter_supports_push
+        if source is None or adapter is None or not adapter_supports_push(adapter):
+            # Non-push adapters (api_server) deliver by running a wake turn —
+            # re-injection, the exact mechanism this lane exists to avoid, so
+            # they have no deliverable route here either.
+            if not evt.get("_route_warned"):
+                evt["_route_warned"] = True
+                logger.warning(
+                    "sdk_background_result has no deliverable route "
+                    "(session_key=%r, source=%s, adapter=%s) — requeued",
+                    evt.get("session_key"),
+                    "resolved" if source is not None else None,
+                    type(adapter).__name__ if adapter is not None else None,
+                )
+            else:
+                logger.debug(
+                    "sdk_background_result still unroutable (session_key=%r)",
+                    evt.get("session_key"),
+                )
+            return False
+        metadata = self._thread_metadata_for_source(source)
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio as _should_send_media_as_audio,
+        )
+        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        for idx, payload in enumerate(payloads):
+            try:
+                media_files, text_content = adapter.extract_media(payload)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files
+                )
+                images, text_content = adapter.extract_images(text_content)
+                if text_content:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=text_content,
+                        metadata=metadata,
+                    )
+                for image_url, alt_text in (images or []):
+                    await adapter.send_image(
+                        chat_id=source.chat_id,
+                        image_url=image_url,
+                        caption=alt_text,
+                        metadata=metadata,
+                    )
+                for media_path, _is_voice in (media_files or []):
+                    _ext = os.path.splitext(media_path)[1].lower()
+                    if _should_send_media_as_audio(
+                        source.platform, _ext, _is_voice
+                    ):
+                        await adapter.send_voice(
+                            chat_id=source.chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif _ext in _VIDEO_EXTS:
+                        await adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif _ext in _IMAGE_EXTS:
+                        await adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    else:
+                        await adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+            except Exception as e:
+                evt["payloads"] = payloads[idx:]
+                logger.warning(
+                    "sdk_background_result send failed at payload %d/%d "
+                    "(%s) — remainder requeued",
+                    idx + 1, len(payloads), e,
+                )
+                return False
+        logger.info(
+            "sdk_background_result delivered: %d payload(s) to %s chat=%s",
+            len(payloads),
+            source.platform.value
+            if hasattr(source.platform, "value") else source.platform,
+            source.chat_id,
+        )
+        return True
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -21985,6 +22113,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
         handled by ``_run_process_watcher`` / the post-turn drain).
+
+        Also owns ``sdk_background_result`` events (a finished
+        claude-agent-sdk background task's answer burst): those are sent
+        DIRECTLY on the platform outbound lane via
+        ``_deliver_sdk_background_result`` — never re-injected as a turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
@@ -22000,7 +22133,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    if evt.get("type") in ("async_delegation", "sdk_background_result"):
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
@@ -22008,6 +22141,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    if evt.get("type") == "sdk_background_result":
+                        try:
+                            delivered = await self._deliver_sdk_background_result(evt)
+                            if delivered is False:
+                                _pr.completion_queue.put(evt)
+                        except Exception as e:
+                            _pr.completion_queue.put(evt)
+                            logger.error(
+                                "SDK background-result delivery error: %s", e,
+                            )
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue

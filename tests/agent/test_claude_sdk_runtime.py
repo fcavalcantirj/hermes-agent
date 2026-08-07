@@ -2629,8 +2629,9 @@ class TestUnsolicitedDelivery:
 
 
 class TestBackgroundDeliveryWiring:
-    """Runtime glue: the session's delivery callback feeds the gateway's
-    existing async-delegation completion pipeline, config-gated."""
+    """Runtime glue: the session's delivery callback enqueues an
+    sdk_background_result event for the gateway watcher's direct outbound
+    send, config-gated."""
 
     def _spy_kwargs(self, monkeypatch):
         import agent.claude_sdk_runtime as runtime_mod
@@ -2688,20 +2689,20 @@ class TestBackgroundDeliveryWiring:
         )
         callback = captured.get("on_unsolicited_result")
         assert callback is not None, "flag defaults ON — callback must be wired"
-        callback(["background answer text"])
+        callback(["Research landed — writing up.", "background answer text"])
         assert len(events) == 1
         evt = events[0]
-        assert evt["type"] == "async_delegation"
-        assert evt["status"] == "completed"
-        # Directive header rides in front of the raw answer so the
-        # completion turn relays instead of shrugging ("No response
-        # requested." — observed live, twice, with renders on disk).
-        assert evt["summary"].endswith("background answer text")
-        assert evt["summary"].startswith("[USER IS WAITING")
-        assert "MEDIA:" in evt["summary"]
+        # Direct-outbound event: the payload burst rides UNJOINED (each text
+        # becomes its own outbound message) and no model-facing directive is
+        # prepended — on a direct send it would leak to the user.
+        assert evt["type"] == "sdk_background_result"
+        assert evt["payloads"] == [
+            "Research landed — writing up.", "background answer text",
+        ]
+        assert not any("[USER IS WAITING" in p for p in evt["payloads"])
         assert evt["session_key"] == "gw-key-7"
         assert evt["parent_session_id"] == "sess-bg-1"
-        assert evt["delegation_id"] == ""
+        assert "delegation_id" not in evt
 
     def test_flag_off_leaves_callback_unwired(self, monkeypatch):
         import hermes_cli.config as cfg

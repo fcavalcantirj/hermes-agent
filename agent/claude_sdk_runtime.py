@@ -576,14 +576,14 @@ def run_claude_agent_sdk_turn(
 
         # Delivery half of the stream-ownership fix: when the CLI finishes a
         # background Agent task between turns, the session captures the
-        # answer and this callback feeds the gateway's EXISTING
-        # async-delegation completion pipeline (completion_queue →
-        # _async_delegation_watcher → synthetic internal turn → platform
-        # send). Empty delegation_id deliberately skips the durable-claim
-        # branch — v1 is in-memory at-least-once, same as the watcher's
-        # requeue semantics. Config-gated, default OFF per the block's
-        # upstream-conservative contract (every default falsy — pinned by
-        # test_canonical_defaults); gateway-bot deployments opt in.
+        # answer burst and this callback enqueues it as an
+        # "sdk_background_result" completion event; the gateway watcher sends
+        # it DIRECTLY on the platform outbound lane (completion_queue →
+        # _async_delegation_watcher → adapter send). In-memory at-least-once,
+        # same as the watcher's requeue semantics. Config-gated, default OFF
+        # per the block's upstream-conservative contract (every default falsy
+        # — pinned by test_canonical_defaults); gateway-bot deployments opt
+        # in.
         on_unsolicited_result = None
         from agent.transports.claude_agent_sdk_session import _provider_flag
 
@@ -598,44 +598,26 @@ def run_claude_agent_sdk_turn(
             _bg_model = getattr(agent, "model", None)
 
             def _deliver_background_result(texts: list[str]) -> None:
+                # The completion is the AGENT'S OWN finished answer — it must
+                # go straight to the platform outbound lane, never back into
+                # the model as a synthetic delegation (2026-08-06 self-echo:
+                # the model recognized its own text, refused to "relay" it,
+                # and the report never left the box). The watcher delivers
+                # each payload as its own outbound message, in order.
                 try:
                     import time as _time
 
                     from tools.process_registry import process_registry
 
-                    text = "\n\n".join(texts)
-                    # Directive header, learned live (2026-07-29): the shared
-                    # completion template is permissive ("you may have moved
-                    # on"), and a long-context model answered it with a
-                    # ritual "No response requested." twice while finished
-                    # renders sat on disk. The user IS waiting — say so, and
-                    # keep MEDIA: attachment lines relayable verbatim.
-                    text = (
-                        "[USER IS WAITING: relay this finished result to the "
-                        "user as your reply NOW — include any MEDIA: lines "
-                        "verbatim so attachments send.]\n\n" + text
-                    )
                     now = _time.time()
                     process_registry.completion_queue.put({
-                        "type": "async_delegation",
-                        "delegation_id": "",
+                        "type": "sdk_background_result",
+                        "payloads": list(texts),
                         "session_key": _bg_session_key,
-                        "origin_ui_session_id": "",
-                        "origin_session_id": "",
                         "parent_session_id": _bg_parent_session_id,
-                        "goal": "background Agent task (claude-agent-sdk)",
-                        "context": None,
-                        "toolsets": None,
-                        "role": None,
                         "model": _bg_model,
-                        "status": "completed",
-                        "summary": text,
-                        "error": None,
-                        "api_calls": 0,
-                        "duration_seconds": 0.0,
                         "dispatched_at": now,
                         "completed_at": now,
-                        "exit_reason": None,
                     })
                 except Exception:
                     logger.warning(
