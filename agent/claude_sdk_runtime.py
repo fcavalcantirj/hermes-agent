@@ -534,6 +534,20 @@ def run_claude_agent_sdk_turn(
     """
     from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
 
+    # P1.b: refresh the approval-context snapshot EVERY turn (including
+    # session-reuse turns). This runs on the agent turn thread, where the
+    # session contextvars are visible; the SDK invokes the approval callback
+    # from its own loop thread, where they never are — the callback reads
+    # this holder instead. A cron turn writes gateway=False (honest deny, no
+    # block); a later interactive turn on the SAME SDK session rewrites it
+    # and un-freezes the cron-born session.
+    try:
+        from tools.approval import current_approval_turn_context
+
+        agent._sdk_approval_turn_ctx = current_approval_turn_context()
+    except Exception:
+        logger.debug("approval turn-context refresh failed", exc_info=True)
+
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
@@ -548,12 +562,18 @@ def run_claude_agent_sdk_turn(
             # bridge the SDK denies every un-allowlisted tool silently, no
             # prompt reaching the user, even though the gateway registers a
             # notify channel around every turn (production finding on a 24/7
-            # telegram deployment). The builder returns None outside
-            # interactive gateway sessions, so CLI and cron postures are
-            # unchanged.
+            # telegram deployment). The builder returns None for surfaces
+            # that are not gateway-shaped, so CLI posture is unchanged; the
+            # context_provider hands it the per-turn snapshot refreshed
+            # above, so cron-ness and the session key are resolved per CALL
+            # (a cron-born session must not be frozen into forever-deny).
             try:
                 from tools.approval import build_sdk_gateway_approval_callback
-                approval_callback = build_sdk_gateway_approval_callback()
+                approval_callback = build_sdk_gateway_approval_callback(
+                    context_provider=lambda: (
+                        getattr(agent, "_sdk_approval_turn_ctx", None) or {}
+                    ),
+                )
             except Exception:
                 approval_callback = None
 

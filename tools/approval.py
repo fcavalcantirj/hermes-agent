@@ -2380,24 +2380,60 @@ def clear_all_session_notify() -> None:
         _session_notify_cbs.clear()
 
 
-def build_sdk_gateway_approval_callback():
+def current_approval_turn_context() -> dict:
+    """Snapshot the TURN-variant approval context for later use on a thread
+    where contextvars are invisible.
+
+    Runtimes whose approval callback fires on a foreign thread (the
+    claude-agent-sdk loop) call this at the top of EVERY turn — on the agent
+    turn thread, where the session contextvars are visible — and hand the
+    snapshot to ``build_sdk_gateway_approval_callback`` via its
+    ``context_provider``.
+    """
+    return {
+        "gateway": _is_gateway_approval_context(),
+        "session_key": get_current_session_key(""),
+    }
+
+
+def build_sdk_gateway_approval_callback(context_provider=None):
     """Approval callback for external agent-loop runtimes (claude-agent-sdk)
     running under the gateway: bridges the SDK's per-tool permission request
     onto the same per-session queue + notify machinery the native terminal
     guard uses, so the user gets a real chat approval prompt instead of a
     silent SDK-internal deny.
 
-    Returns None outside an interactive gateway approval context — the CLI
-    keeps its thread-local callback (tools.terminal_tool), and cron/headless
-    sessions keep their allowlist-or-deny posture: a nightly turn must never
-    block on a prompt. ``_is_gateway_approval_context`` is the SSOT for that
-    distinction.
+    Returns None only for surfaces that are not gateway-shaped (no
+    ``HERMES_GATEWAY_SESSION`` env and no session platform binding): the CLI
+    keeps its thread-local callback (tools.terminal_tool) and one-shot
+    processes keep the SDK's settings posture. Build-time invariance proof:
+    ``HERMES_GATEWAY_SESSION`` is process-level (tui_gateway sets it once at
+    startup; nothing unsets it), and a process where no code ever binds a
+    session platform (pure CLI/one-shot) has no path that starts binding one
+    mid-lifetime — so "not gateway-shaped at SDK-session creation" cannot
+    flip for that session's lifetime.
 
-    The session key is bound EARLY, at SDK-session creation on the agent
-    turn thread where ``set_current_session_key`` bound the contextvar — the
-    SDK invokes the callback from its own loop thread, where the contextvar
-    is not propagated. The notify callback is looked up at CALL time because
-    gateway registration is per-turn (register/unregister_gateway_notify).
+    EVERYTHING TURN-VARIANT is resolved per call, not at build (P1.b —
+    sticky-session binding fix): the cron veto and the session key change
+    from turn to turn on one long-lived SDK session, and freezing them at
+    creation made a session first created during a CRON turn silently deny
+    every un-allowlisted tool FOREVER, even in later interactive turns.
+    Per-call resolution order:
+
+    1. live contextvar read — wins when the callback runs on a thread that
+       can see the turn's context (native-thread invocations, tests);
+    2. ``context_provider()`` — the runtime's per-turn snapshot (see
+       ``current_approval_turn_context``), the production path: the SDK
+       invokes the callback from its own loop thread, where session
+       contextvars are NEVER propagated, so a live read there is empty;
+    3. build-time snapshot — provider-less callers keep the pre-W9
+       bind-early semantics.
+
+    A cron turn resolves gateway=False and lands in the honest no-approver
+    deny WITHOUT paging or blocking — cron's allowlist-or-deny posture is
+    preserved because settings allow-rules suppress prompts before
+    ``can_use_tool`` is ever consulted; only would-be prompts reach this
+    callback, and they deny immediately.
 
     Known v1 semantics (deliberate, documented trade-offs):
 
@@ -2414,11 +2450,14 @@ def build_sdk_gateway_approval_callback():
       displayed prompt. The interactive one-tap flow this bridge exists for
       is unaffected.
     """
-    if not _is_gateway_approval_context():
+    gateway_shaped = env_var_enabled("HERMES_GATEWAY_SESSION") or bool(
+        _get_session_platform()
+    )
+    if not gateway_shaped:
         return None
-    session_key = get_current_session_key("")
-    if not session_key:
-        return None
+    # Build-time snapshots: the fallback for provider-less callers only.
+    _build_gateway = _is_gateway_approval_context()
+    _build_key = get_current_session_key("")
 
     def _sdk_gateway_approval(command: str, description: str, *,
                               allow_permanent: bool = False):
@@ -2430,14 +2469,39 @@ def build_sdk_gateway_approval_callback():
         # timeout, no-approver and notify-failure each carry their own
         # reason (the model used to hear "denied by user" for prompts no
         # user ever saw — 2026-08-06 incident).
-        with _lock:
-            # Turn registration wins; the session-scoped entry is the
-            # between-turns fallback that lets a background SDK turn page
-            # the operator.
-            notify_cb = (
-                _gateway_notify_cbs.get(session_key)
-                or _session_notify_cbs.get(session_key)
-            )
+        #
+        # Per-call context resolution (P1.b). The discriminator is the LIVE
+        # KEY, not the live gateway check: on a TUI SDK-thread call the
+        # process-level HERMES_GATEWAY_SESSION env is visible while the key
+        # contextvar is not — branching on the gateway check alone would
+        # grab an empty key and wrongly deny.
+        live_key = get_current_session_key("")
+        if live_key:
+            session_key = live_key
+            gateway = _is_gateway_approval_context()
+        elif context_provider is not None:
+            try:
+                ctx = context_provider() or {}
+            except Exception:
+                logger.debug(
+                    "SDK approval context_provider raised", exc_info=True,
+                )
+                ctx = {}
+            session_key = str(ctx.get("session_key") or "")
+            gateway = bool(ctx.get("gateway"))
+        else:
+            session_key = _build_key
+            gateway = _build_gateway
+        notify_cb = None
+        if gateway and session_key:
+            with _lock:
+                # Turn registration wins; the session-scoped entry is the
+                # between-turns fallback that lets a background SDK turn
+                # page the operator.
+                notify_cb = (
+                    _gateway_notify_cbs.get(session_key)
+                    or _session_notify_cbs.get(session_key)
+                )
         if notify_cb is None:
             # No approver anywhere (background context with no session
             # registration, or gateway tearing down): fail closed, but say

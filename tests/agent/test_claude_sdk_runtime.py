@@ -12,6 +12,7 @@ retire the client rather than silently continue.
 
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -2431,13 +2432,31 @@ class TestGatewayApprovalBridge:
         assert build_sdk_gateway_approval_callback() is None
 
     def test_builder_returns_none_for_cron_sessions(self, monkeypatch):
-        # A nightly turn must never block on a prompt: cron keeps the
-        # settings.json allowlist-or-deny posture.
+        # UPDATED (W9): this test used to pin builder→None for cron contexts
+        # — which FROZE a session first created during a cron turn into
+        # callback=None forever (silent deny in every later interactive
+        # turn, the sticky-session incident defect). The builder now wires a
+        # callback for any gateway-shaped surface and resolves cron-ness per
+        # CALL. Cron posture is preserved: settings allow-rules suppress
+        # prompts before can_use_tool is consulted, and a would-be prompt
+        # during a cron turn denies IMMEDIATELY with an honest reason —
+        # never blocks, never pages, never enqueues.
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
-        from tools.approval import build_sdk_gateway_approval_callback
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        from tools import approval as approval_mod
 
-        assert build_sdk_gateway_approval_callback() is None
+        cb = approval_mod.build_sdk_gateway_approval_callback()
+        assert cb is not None  # gateway-shaped: no more cron-born freeze
+        result = cb("Bash(ls)", "Claude requests tool Bash")
+        assert result == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert "denied by user" not in result["reason"]
+        # Never blocked, never enqueued: no pending approval anywhere.
+        with approval_mod._lock:
+            assert not approval_mod._gateway_queues
 
     def test_gateway_context_wires_can_use_tool(self, monkeypatch):
         approval_mod, token = self._gateway_ctx(monkeypatch, "tg:152:main")
@@ -2631,6 +2650,150 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.unregister_session_notify(sk)
             approval_mod.reset_current_session_key(token)
+
+    def test_cron_born_session_approves_in_later_interactive_turn(
+        self, monkeypatch,
+    ):
+        # Sticky-session freeze (incident defect 3): the SDK session and its
+        # approval callback are frozen at creation; a session FIRST created
+        # during a cron turn got callback=None forever — every
+        # un-allowlisted tool silently denied even in later interactive
+        # turns, until a session retire. Per-call resolution: the SAME
+        # callback object denies honestly during cron turns and pages the
+        # operator normally once an interactive turn refreshes the context.
+        from tools import approval as approval_mod
+
+        sk = "sess-cron-born"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        # What the cron turn's per-turn refresh writes into the holder.
+        holder = {"gateway": False, "session_key": ""}
+        cb = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: dict(holder)
+        )
+        # RED pre-fix: the builder returned None for cron contexts, which
+        # is exactly the freeze.
+        assert cb is not None
+
+        # Prompt during the cron turn: immediate honest deny — no paging,
+        # no blocking, posture preserved.
+        result = cb("Bash(ls)", "desc")
+        assert result["reason"] == "no approver available (background context)"
+
+        # Later INTERACTIVE turn on the SAME SDK session: the runtime's
+        # per-turn refresh rewrites the holder; the gateway registers its
+        # turn notify. No session retire happened.
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        holder.update({"gateway": True, "session_key": sk})
+        notify, seen = self._resolve_with(approval_mod, sk, "once")
+        approval_mod.register_gateway_notify(sk, notify)
+        try:
+            # Invoke from a FRESH thread — the SDK loop-thread reality:
+            # contextvars invisible, so the holder must carry the context.
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Bash(uname)", "desc"))
+            )
+            t.start()
+            t.join(timeout=10)
+            assert out.get("r") == "once"
+            assert len(seen) == 1
+            assert seen[0]["command"] == "Bash(uname)"
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+
+    def test_no_context_deny_is_honest(self, monkeypatch, caplog):
+        # A background prompt on a session whose latest turn context is
+        # empty (no gateway, no key) must deny with the honest reason —
+        # never the "denied by user" lie, never silently.
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        cb = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: {}
+        )
+        assert cb is not None
+        out = {}
+        with caplog.at_level(logging.WARNING, logger="tools.approval"):
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Read(/x)", "desc"))
+            )
+            t.start()
+            t.join(timeout=10)
+        assert out.get("r") == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert any(
+            "NO approver available" in r.getMessage() for r in caplog.records
+        )
+
+    def test_turn_refreshes_sdk_approval_context_snapshot(self, monkeypatch):
+        # Runtime seam: the holder is rewritten at the TOP of
+        # run_claude_agent_sdk_turn on every call — that per-turn refresh is
+        # what un-freezes a cron-born session.
+        import hermes_cli.config as cfg
+        from tools import approval as approval_mod
+
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input, **kw):
+                return _make_turn()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.claude_agent_sdk_session.ClaudeAgentSdkSession",
+            SpySession,
+        )
+        monkeypatch.setattr(
+            cfg, "load_config_readonly", lambda *a, **k: {}, raising=False
+        )
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        token = approval_mod.set_current_session_key("turn-key-1")
+        try:
+            run_claude_agent_sdk_turn(
+                agent, user_message="hi", original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="t",
+            )
+        finally:
+            approval_mod.reset_current_session_key(token)
+        assert agent._sdk_approval_turn_ctx == {
+            "gateway": True, "session_key": "turn-key-1",
+        }
+        assert captured.get("approval_callback") is not None  # bridge wired
+
+        # Second call under a DIFFERENT key: the snapshot is rewritten (the
+        # refresh runs before any session logic; forcing re-creation keeps
+        # the spy simple — the refresh itself is call-scoped, not
+        # creation-scoped).
+        agent._claude_sdk_session = None
+        token = approval_mod.set_current_session_key("turn-key-2")
+        try:
+            run_claude_agent_sdk_turn(
+                agent, user_message="again", original_user_message="again",
+                messages=[{"role": "user", "content": "again"}],
+                effective_task_id="t",
+            )
+        finally:
+            approval_mod.reset_current_session_key(token)
+        assert agent._sdk_approval_turn_ctx == {
+            "gateway": True, "session_key": "turn-key-2",
+        }
 
     def _resolve_with(self, approval_mod, session_key, choice):
         seen = []
