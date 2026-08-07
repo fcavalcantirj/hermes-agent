@@ -1029,8 +1029,23 @@ class ClaudeAgentSdkSession:
 
     def _make_can_use_tool(self) -> Any:
         """Bridge SDK permission requests onto Hermes' approval callback.
-        Fail-closed: any callback failure denies."""
+        Fail-closed: any callback failure denies.
+
+        Silent-deny observability (P2.d): every deny that was NOT an
+        operator's choice is logged at INFO here — this is the choke point
+        every SDK-lane deny transits with tool name and honest reason in
+        hand (the 2026-08-06 incident's silent denies had no log line at
+        all). "denied by user" (with or without ": <text>") appears IFF a
+        human chose deny — W8/W11 reserved that wording — so the prefix is
+        the discriminator; operator denies are not silent and not logged
+        here. Honesty boundary: settings deny-rule hits on the SDK side
+        (the CLI consulting ~/.claude/settings.json deny rules, e.g. an
+        installer-only skills-dir rule) never invoke can_use_tool and never
+        transit hermes code — they are UNLOGGABLE here by construction;
+        operator-facing relief for that class is a separate deny-notice
+        feature decision."""
         approval_callback = self._approval_callback
+        hermes_session_id = self._hermes_session_id
 
         async def _can_use_tool(tool_name: str, tool_input: dict, context: Any):
             from claude_agent_sdk import (
@@ -1058,12 +1073,17 @@ class ClaudeAgentSdkSession:
                 )
             except Exception:
                 logger.exception("approval_callback raised on SDK permission")
+                logger.info(
+                    "claude-agent-sdk: silent deny (no operator choice): "
+                    "tool=%s reason=%s session=%s",
+                    tool_name, "approval callback failed", hermes_session_id,
+                )
                 return PermissionResultDeny(message="approval callback failed")
             # Widened callback contract: a plain choice string, or a dict
             # {"choice": str, "reason": str} carrying an honest deny reason
-            # (no-approver / timeout / notify-failure). "denied by user" is
-            # reserved for a real human deny — a reason-bearing deny must
-            # never be attributed to the user.
+            # (no-approver / timeout / notify-failure / teardown-expiry).
+            # "denied by user" is reserved for a real human deny — a
+            # reason-bearing deny must never be attributed to the user.
             reason = None
             choice = result
             if isinstance(result, dict):
@@ -1071,7 +1091,19 @@ class ClaudeAgentSdkSession:
                 choice = result.get("choice")
             if choice in ("once", "session", "always"):
                 return PermissionResultAllow()
-            return PermissionResultDeny(message=reason or "denied by user")
+            if choice == "timeout" and not reason:
+                # The CLI thread-local callback surfaces its prompt timeout
+                # as a bare string; mapping it to the user-deny default
+                # would fabricate attribution for a prompt nobody answered.
+                reason = "approval timed out — no operator response"
+            message = reason or "denied by user"
+            if not message.startswith("denied by user"):
+                logger.info(
+                    "claude-agent-sdk: silent deny (no operator choice): "
+                    "tool=%s reason=%s session=%s",
+                    tool_name, message, hermes_session_id,
+                )
+            return PermissionResultDeny(message=message)
 
         return _can_use_tool
 

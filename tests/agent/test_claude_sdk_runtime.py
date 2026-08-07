@@ -2703,6 +2703,100 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.unregister_gateway_notify(sk)
 
+    def test_silent_denies_logged_with_tool_and_reason(
+        self, monkeypatch, caplog,
+    ):
+        # P2.d: every deny that transits the SDK lane WITHOUT an operator
+        # tap must be observable — the incident's silent denies had no log
+        # line at all. The choke point is _make_can_use_tool; "denied by
+        # user" is the trustworthy operator-attribution prefix (W8/W11)
+        # and is deliberately NOT logged as silent.
+        SILENT = "silent deny (no operator choice)"
+
+        def _records(cl):
+            return [r for r in cl.records if SILENT in r.getMessage()]
+
+        def _deny_via(callback, cl):
+            session, _ = _make_session(
+                approval_callback=callback, permission_mode="default",
+                hermes_session_id="sess-w13",
+            )
+            with cl.at_level(
+                logging.INFO,
+                logger="agent.transports.claude_agent_sdk_session",
+            ):
+                return asyncio.run(
+                    session._make_can_use_tool()("Bash", {"command": "x"}, None)
+                )
+
+        # Class 1 — no-approver, via the REAL bridge (nothing registered).
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-w13-none")
+        try:
+            caplog.clear()
+            res = _deny_via(
+                approval_mod.build_sdk_gateway_approval_callback(), caplog,
+            )
+            assert res.message == "no approver available (background context)"
+            recs = _records(caplog)
+            assert len(recs) == 1
+            msg = recs[0].getMessage()
+            assert "tool=Bash" in msg
+            assert "no approver available" in msg
+            assert "session=sess-w13" in msg
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        # Classes 2–3 — timeout and teardown-expiry reasons (the real
+        # bridge produces these dicts; the choke point must log them).
+        for reason in (
+            "approval timed out — no operator response",
+            "approval expired (turn ended)",
+        ):
+            caplog.clear()
+            res = _deny_via(
+                lambda *a, **k: {"choice": "deny", "reason": reason}, caplog,
+            )
+            assert res.message == reason
+            recs = _records(caplog)
+            assert len(recs) == 1
+            assert reason in recs[0].getMessage()
+            assert "tool=Bash" in recs[0].getMessage()
+
+        # Class 4 — callback failure.
+        caplog.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("bridge exploded")
+
+        res = _deny_via(_boom, caplog)
+        assert res.message == "approval callback failed"
+        recs = _records(caplog)
+        assert len(recs) == 1
+        assert "approval callback failed" in recs[0].getMessage()
+
+        # Class 5 — the CLI thread-local callback's bare "timeout" string:
+        # previously mapped to "denied by user" (fabricated attribution).
+        caplog.clear()
+        res = _deny_via(lambda *a, **k: "timeout", caplog)
+        assert res.message == "approval timed out — no operator response"
+        assert len(_records(caplog)) == 1
+
+        # NEGATIVES — operator denies are NOT silent: no log line.
+        for operator_deny in (
+            lambda *a, **k: "deny",
+            lambda *a, **k: {"choice": "deny", "reason": "denied by user: not now"},
+        ):
+            caplog.clear()
+            res = _deny_via(operator_deny, caplog)
+            assert res.message.startswith("denied by user")
+            assert _records(caplog) == []
+
+        # Allow path logs nothing either.
+        caplog.clear()
+        res = _deny_via(lambda *a, **k: "once", caplog)
+        assert type(res).__name__ == "PermissionResultAllow"
+        assert _records(caplog) == []
+
     def test_teardown_resolves_inflight_prompts_as_expired(self, monkeypatch):
         # Incident defect 2 (observed 08-04 and 08-06): turn teardown
         # signaled the blocked approval wait with an UNSET result; the
