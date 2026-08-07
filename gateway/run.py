@@ -1101,6 +1101,14 @@ def _build_replay_entry(
             elif not _rval:
                 continue
             entry[_rkey] = _rval
+        # Row-marker carry: a projected background result
+        # (display_kind="sdk_background_result") must stay identifiable
+        # through this rebuild or the continuity digest cannot exclude it —
+        # re-presenting the agent's own delivered answer is the exact
+        # double-presentation pathology the SDK background lane fixes.
+        # Providers never see the field (the api_messages build strips it).
+        if msg.get("display_kind"):
+            entry["display_kind"] = msg["display_kind"]
     if preserve_timestamp:
         ts = msg.get("timestamp")
         if ts:
@@ -21986,6 +21994,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         delivers only the remainder). ``None`` = empty event, nothing to send.
         A missing route fails SAFE with ``False`` — the payload is a finished
         result the user is waiting on; it must never be dropped silently.
+
+        Durability contract: every payload is projected into the hermes
+        transcript BEFORE any routing or send (save the text first — the
+        2026-08-06 report was FTS-invisible and one session retire away from
+        unrecoverable), marked ``display_kind="sdk_background_result"`` so
+        the continuity digest never re-presents the agent's own delivered
+        answer, and each send is registered as a delivery-ledger obligation.
+        Projection and ledger trouble never block the send.
         """
         payloads = [
             p for p in (evt.get("payloads") or [])
@@ -21996,6 +22012,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "sdk_background_result event carried no payloads — dropping",
             )
             return None
+        if not evt.get("_projected"):
+            # Once per event lifetime — a requeued retry (trimmed or
+            # unroutable) must not write duplicate transcript rows.
+            evt["_projected"] = True
+            _db = getattr(self, "_session_db", None)
+            _parent = str(evt.get("parent_session_id") or "").strip()
+            if _db is None or not _parent:
+                logger.warning(
+                    "sdk_background_result not projected into transcript "
+                    "(session_db=%s, parent_session_id=%r) — payloads remain "
+                    "queue-only",
+                    "ok" if _db is not None else None, _parent,
+                )
+            else:
+                for _payload in payloads:
+                    try:
+                        await _db.append_message(
+                            session_id=_parent,
+                            role="assistant",
+                            content=_payload,
+                            display_kind="sdk_background_result",
+                            display_metadata={
+                                "completed_at": evt.get("completed_at"),
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "sdk_background_result transcript projection "
+                            "failed for session %s — continuing with "
+                            "delivery", _parent, exc_info=True,
+                        )
         source = self._build_process_event_source(evt)
         adapter = None
         if source is not None:
@@ -22033,9 +22080,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             BasePlatformAdapter,
             should_send_media_as_audio as _should_send_media_as_audio,
         )
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            mark_delivered,
+            mark_failed,
+            record_obligation,
+        )
+        try:
+            _ledger_on = await asyncio.to_thread(ledger_enabled)
+        except Exception:
+            _ledger_on = False
+        _session_key = str(evt.get("session_key") or "")
+        _obligation_ref = f"sdk_bg:{evt.get('completed_at') or ''}"
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         for idx, payload in enumerate(payloads):
+            _obligation_id = None
+            if _ledger_on:
+                try:
+                    _obligation_id = compute_obligation_id(
+                        _session_key, _obligation_ref, payload,
+                    )
+                    await asyncio.to_thread(
+                        record_obligation,
+                        obligation_id=_obligation_id,
+                        session_key=_session_key,
+                        platform=platform_name,
+                        chat_id=source.chat_id,
+                        thread_id=source.thread_id,
+                        content=payload,
+                    )
+                    await asyncio.to_thread(mark_attempting, _obligation_id)
+                except Exception:
+                    logger.debug(
+                        "sdk_background_result ledger record failed",
+                        exc_info=True,
+                    )
+                    _obligation_id = None
             try:
                 media_files, text_content = adapter.extract_media(payload)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(
@@ -22084,6 +22167,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=metadata,
                         )
             except Exception as e:
+                if _obligation_id:
+                    try:
+                        await asyncio.to_thread(
+                            mark_failed, _obligation_id, str(e),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "sdk_background_result mark_failed failed",
+                            exc_info=True,
+                        )
                 evt["payloads"] = payloads[idx:]
                 logger.warning(
                     "sdk_background_result send failed at payload %d/%d "
@@ -22091,6 +22184,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     idx + 1, len(payloads), e,
                 )
                 return False
+            if _obligation_id:
+                try:
+                    await asyncio.to_thread(mark_delivered, _obligation_id)
+                except Exception:
+                    logger.debug(
+                        "sdk_background_result mark_delivered failed",
+                        exc_info=True,
+                    )
         logger.info(
             "sdk_background_result delivered: %d payload(s) to %s chat=%s",
             len(payloads),

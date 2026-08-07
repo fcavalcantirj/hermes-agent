@@ -12,11 +12,37 @@ never silently dropped.
 
 import asyncio
 import queue
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner, _drain_gateway_watch_events
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ledger_db(tmp_path, monkeypatch):
+    """Point the delivery ledger at a throwaway state.db per test."""
+    import gateway.delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "state.db")
+    return tmp_path / "state.db"
+
+
+def _ledger_rows(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM delivery_obligations ORDER BY created_at"
+            )
+        ]
+    finally:
+        conn.close()
 
 
 def _adapter(**over):
@@ -43,6 +69,7 @@ def _runner(adapter):
     )
     runner._session_source_cache = {}
     runner._thread_metadata_for_source = lambda source, mid=None: None
+    runner._session_db = SimpleNamespace(append_message=AsyncMock())
     return runner
 
 
@@ -131,6 +158,74 @@ def test_bg_result_partial_failure_requeues_remaining():
     assert delivered is False
     # The delivered prefix is trimmed so the retry sends only the remainder.
     assert evt["payloads"] == ["two", "three"]
+
+
+def test_bg_result_projected_into_transcript(_fresh_ledger_db):
+    # D3: the incident's report never entered state.db — FTS-invisible, one
+    # session retire away from unrecoverable. EVERY payload of the burst
+    # must project, intermediates included, marked for digest exclusion.
+    adapter = _adapter()
+    runner = _runner(adapter)
+    evt = _event()
+
+    delivered = asyncio.run(runner._deliver_sdk_background_result(evt))
+
+    assert delivered is True
+    project = runner._session_db.append_message
+    assert project.call_count == 2
+    for call, payload in zip(
+        project.call_args_list,
+        ["Research landed — writing up.", "the full report"],
+    ):
+        assert call.kwargs["session_id"] == "sess-bg-1"
+        assert call.kwargs["role"] == "assistant"
+        assert call.kwargs["content"] == payload
+        assert call.kwargs["display_kind"] == "sdk_background_result"
+
+    # Save-first: an UNROUTABLE event still projects — the text becomes
+    # durable even while delivery is stuck.
+    runner2 = _runner(_adapter())
+    evt2 = _event(session_key="")
+    assert asyncio.run(runner2._deliver_sdk_background_result(evt2)) is False
+    assert runner2._session_db.append_message.call_count == 2
+
+
+def test_bg_result_registers_delivery_ledger_obligation(_fresh_ledger_db):
+    adapter = _adapter()
+    runner = _runner(adapter)
+    evt = _event()
+
+    delivered = asyncio.run(runner._deliver_sdk_background_result(evt))
+
+    assert delivered is True
+    rows = _ledger_rows(_fresh_ledger_db)
+    assert len(rows) == 2
+    contents = {r["content"] for r in rows}
+    assert contents == {"Research landed — writing up.", "the full report"}
+    assert all(r["state"] == "delivered" for r in rows)
+    assert all(r["session_key"] == "agent:main:telegram:dm:12345:678" for r in rows)
+    assert all(r["platform"] == "telegram" for r in rows)
+
+
+def test_requeued_event_does_not_double_project(_fresh_ledger_db):
+    adapter = _adapter()
+    adapter.send = AsyncMock(side_effect=[None, RuntimeError("flaky"), None])
+    runner = _runner(adapter)
+    evt = _event(payloads=["one", "two"])
+
+    # First pass: payload 1 sends, payload 2 fails -> requeue contract.
+    assert asyncio.run(runner._deliver_sdk_background_result(evt)) is False
+    assert evt["payloads"] == ["two"]
+    assert runner._session_db.append_message.call_count == 2
+
+    # Retry of the SAME event: no re-projection, remainder delivers.
+    assert asyncio.run(runner._deliver_sdk_background_result(evt)) is True
+    assert runner._session_db.append_message.call_count == 2
+
+    rows = {r["content"]: r["state"] for r in _ledger_rows(_fresh_ledger_db)}
+    # The failed payload's obligation was restarted on retry and ends
+    # delivered; no duplicate rows exist (same obligation id both passes).
+    assert rows == {"one": "delivered", "two": "delivered"}
 
 
 def test_post_turn_drain_leaves_sdk_background_result_on_queue():

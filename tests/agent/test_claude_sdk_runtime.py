@@ -1539,6 +1539,26 @@ class TestContinuity:
         assert "shadowed imports" in sent
         assert sent.endswith("and the tests?")
 
+    def test_projected_bg_row_excluded_from_continuity_digest(self):
+        # Binding amendment (sdk-echo-approval-fixes): rows projected by the
+        # background-result lane are the agent's OWN delivered answers —
+        # the digest re-presenting them is double-presentation, the exact
+        # pathology the lane fixes. Marked rows never enter the digest.
+        from agent.claude_sdk_runtime import _render_continuity_digest
+
+        digest = _render_continuity_digest([
+            {"role": "user", "content": "run the research"},
+            {
+                "role": "assistant",
+                "content": "the full background report",
+                "display_kind": "sdk_background_result",
+            },
+            {"role": "assistant", "content": "a normal reply"},
+        ])
+        assert "the full background report" not in digest
+        assert "run the research" in digest
+        assert "a normal reply" in digest
+
     def test_no_digest_on_brand_new_conversation(self, monkeypatch):
         agent, _db = self._db_agent(persisted_sdk_id=None)
         instances = self._spy_sessions(monkeypatch, [_make_turn()])

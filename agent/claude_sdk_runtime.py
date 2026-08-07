@@ -432,6 +432,17 @@ def _render_continuity_digest(prior_messages: List[Dict[str, Any]]) -> str:
     """Bounded text preamble for a FRESH SDK session that has prior Hermes
     history (resume impossible: no stored id, or the stored one went stale).
     Reuses _digest_history's compaction, then flattens to capped text."""
+    # Projected background results are the agent's OWN answers, already
+    # delivered outbound; re-presenting them here is the double-presentation
+    # pathology the background lane exists to kill. Filter before the
+    # compaction pass — _digest_history may rebuild dicts and drop the mark.
+    prior_messages = [
+        m for m in (prior_messages or [])
+        if not (
+            isinstance(m, dict)
+            and m.get("display_kind") == "sdk_background_result"
+        )
+    ]
     try:
         from agent.background_review import _digest_history
 
