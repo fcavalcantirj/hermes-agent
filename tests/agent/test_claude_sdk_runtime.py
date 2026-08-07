@@ -610,6 +610,20 @@ def _patch_external_mcp(monkeypatch, servers):
     )
 
 
+def _patch_oauth_tokens(monkeypatch, result):
+    """Point the session module's cached-OAuth-token seam
+    (`_has_oauth_tokens(server_name)`) at a canned result; pass a callable
+    to script a raising probe. raising=False on purpose: pre-fix the seam
+    does not exist yet, and these tests must go RED on the ROUTING
+    assertions below, never on monkeypatch plumbing. It also keeps every
+    test hermetic against the developer's REAL ~/.hermes/mcp-tokens/
+    directory — a box with a live notion login must not flip outcomes."""
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+    fn = result if callable(result) else (lambda name: result)
+    monkeypatch.setattr(sdk_session_mod, "_has_oauth_tokens", fn, raising=False)
+
+
 class TestExternalMcpServers:
     """config.yaml `mcp_servers:` entries must reach the SDK's mcp_servers
     dict. Today build_option_fields() registers ONLY the internal
@@ -661,14 +675,16 @@ class TestExternalMcpServers:
         assert "on-default" in servers
 
     def test_http_server_shape(self, monkeypatch):
-        # A remote OAuth server (notion) cannot authenticate under this
-        # fallback (the SDK-spawned CLI cannot read Hermes' stored OAuth
-        # tokens) — but it must still emit a VALID http config, never crash
-        # the build or corrupt sibling servers. Hermes-only keys (auth,
-        # timeout, ...) are not forwarded to the SDK.
+        # A remote OAuth server with NO cached Hermes tokens keeps today's
+        # bare-http fallback: still a VALID config (visible + diagnosable in
+        # the SDK CLI), never a crash, never corrupted siblings. Hermes-only
+        # keys (auth, timeout, ...) are not forwarded to the SDK. The
+        # authenticated case routes through the stdio OAuth proxy instead —
+        # see TestOAuthProxyRouting.
         _patch_external_mcp(monkeypatch, {
             "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
         })
+        _patch_oauth_tokens(monkeypatch, False)
         servers = _make_session()[0].build_option_fields()["mcp_servers"]
         assert servers["notion"] == {
             "type": "http",
@@ -755,6 +771,110 @@ class TestExternalMcpServers:
         assert set(fields["mcp_servers"]) == {"hermes-tools"}
         # The helper itself is the soft-failure boundary: {} on any error.
         assert sdk_session_mod._build_external_mcp_configs() == {}
+
+
+# ---------- OAuth stdio proxy routing (mcp_servers: auth: oauth) ----------
+
+
+class TestOAuthProxyRouting:
+    """A remote `auth: oauth` entry whose tokens are cached in Hermes's own
+    store (~/.hermes/mcp-tokens/, via HermesTokenStorage) must route through
+    the Hermes-side stdio OAuth proxy (agent.transports.oauth_mcp_proxy) —
+    the same spawn-a-python-stdio-server pattern as hermes-tools — because
+    the SDK-spawned CLI can never read Hermes's token store itself. Without
+    cached tokens the entry keeps today's bare-http fallback: a doomed proxy
+    is never spawned, and the raw entry stays visible/diagnosable instead of
+    silently vanishing."""
+
+    def test_oauth_entry_with_tokens_becomes_stdio_proxy(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        entry = servers["notion"]
+        assert entry["type"] == "stdio"
+        assert entry["command"] == sys.executable
+        # The child re-reads config.yaml + the token store itself, so argv
+        # carries only the server name — no URL, no secrets.
+        assert entry["args"] == [
+            "-m", "agent.transports.oauth_mcp_proxy", "--server", "notion",
+        ]
+        # Same env discipline as the hermes-tools wrapper: repo root on
+        # PYTHONPATH so `-m` resolves, and no raw http fields left behind.
+        assert "PYTHONPATH" in entry["env"]
+        assert "url" not in entry
+        assert "headers" not in entry
+
+    def test_oauth_entry_tokens_probed_by_server_name(self, monkeypatch):
+        # The token probe must key on the config entry NAME (that is what
+        # HermesTokenStorage files are keyed by), not the URL.
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+            "linear": {"url": "https://mcp.linear.app/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, lambda name: name == "notion")
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"]["type"] == "stdio"
+        assert servers["linear"] == {
+            "type": "http", "url": "https://mcp.linear.app/mcp",
+        }
+
+    def test_token_probe_crash_falls_back_to_bare_http(self, monkeypatch):
+        # A broken token dir (perms, corrupt profile) must degrade to
+        # today's no-auth behavior — never take the whole merge down.
+        def _boom(name):
+            raise RuntimeError("token dir unreadable")
+
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, _boom)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"] == {
+            "type": "http", "url": "https://mcp.notion.com/mcp",
+        }
+
+    def test_oauth_sse_entry_keeps_raw_sse(self, monkeypatch):
+        # Scoped: the proxy speaks streamable HTTP to the remote. An
+        # `transport: sse` OAuth entry keeps today's raw sse emission until
+        # the proxy grows an SSE client path.
+        _patch_external_mcp(monkeypatch, {
+            "events": {
+                "url": "https://example.com/sse",
+                "transport": "sse",
+                "auth": "oauth",
+            },
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["events"] == {
+            "type": "sse", "url": "https://example.com/sse",
+        }
+
+    def test_non_oauth_entry_never_probes_tokens(self, monkeypatch):
+        # `auth: oauth` is the ONLY trigger (mcp_tool.py:3060 semantics);
+        # a plain http entry stays plain even when a token file exists.
+        _patch_external_mcp(monkeypatch, {
+            "api": {"url": "https://api.example.com/mcp"},
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["api"] == {
+            "type": "http", "url": "https://api.example.com/mcp",
+        }
+
+    def test_has_oauth_tokens_reads_hermes_token_store(self, tmp_path, monkeypatch):
+        # The seam itself: backed by HermesTokenStorage's on-disk layout
+        # (HERMES_HOME/mcp-tokens/<server>.json), Hermes's single source of
+        # truth for MCP OAuth state.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mcp-tokens").mkdir()
+        (tmp_path / "mcp-tokens" / "notion.json").write_text("{}")
+        from agent.transports.claude_agent_sdk_session import _has_oauth_tokens
+
+        assert _has_oauth_tokens("notion") is True
+        assert _has_oauth_tokens("linear") is False
 
 
 # ---------- runtime glue ----------

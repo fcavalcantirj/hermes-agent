@@ -317,6 +317,22 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def _mcp_subprocess_env() -> dict[str, str]:
+    """Env shared by every Hermes-spawned stdio MCP subprocess: the
+    allowlisted ambient vars plus the repo root on PYTHONPATH so `-m`
+    resolves (McpStdioServerConfig has no cwd field). Shared by
+    `_build_hermes_tools_mcp_config` and the OAuth stdio proxy branch of
+    `_build_external_mcp_configs` so the two subprocess launchers cannot
+    drift apart."""
+    env = {
+        key: os.environ[key]
+        for key in _MCP_ENV_ALLOWLIST
+        if os.environ.get(key)
+    }
+    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + os.environ.get("PYTHONPATH", "")
+    return env
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -324,12 +340,7 @@ def _build_hermes_tools_mcp_config(
     the exact server the codex runtime uses (backend-agnostic), launched with
     this venv's interpreter. McpStdioServerConfig has no cwd field, so the
     repo root rides PYTHONPATH."""
-    env = {
-        key: os.environ[key]
-        for key in _MCP_ENV_ALLOWLIST
-        if os.environ.get(key)
-    }
-    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env = _mcp_subprocess_env()
     if hermes_session_id:
         # Lets the stateless session_search shim exclude the calling
         # session's own lineage from recall results (#26567). The shim reads
@@ -358,13 +369,33 @@ def _load_mcp_config() -> dict[str, Any]:
 _RESERVED_MCP_KEYS = frozenset({"hermes-tools"})
 
 
+def _has_oauth_tokens(server_name: str) -> bool:
+    """Whether Hermes's own OAuth token store (~/.hermes/mcp-tokens/, see
+    tools.mcp_oauth.HermesTokenStorage) already has cached tokens for
+    `server_name`. Module-level name so tests can stub it; lazy import
+    because tools.mcp_oauth is heavy. Any failure (unreadable dir, corrupt
+    profile, ...) degrades to False — this is a probe, never a hard
+    dependency."""
+    try:
+        from tools.mcp_oauth import HermesTokenStorage
+
+        return HermesTokenStorage(server_name).has_cached_tokens()
+    except Exception:
+        return False
+
+
 def _build_external_mcp_configs() -> dict[str, dict[str, Any]]:
     """Convert enabled config.yaml mcp_servers entries into SDK-typed configs.
 
-    Known accepted caveat: a remote `auth: oauth` server (e.g. Notion) emits
-    a valid http config here but won't actually authenticate under this
-    fallback, because the SDK-spawned CLI can't read Hermes's own OAuth
-    token store. Expected/acceptable, not a bug to fix here.
+    A remote `auth: oauth` server (e.g. Notion) with cached Hermes tokens
+    (`_has_oauth_tokens`) routes through the Hermes-side stdio OAuth proxy
+    (agent.transports.oauth_mcp_proxy) instead of a raw http config, because
+    the SDK-spawned CLI can never read Hermes's own OAuth token store
+    itself. Without cached tokens (or on token-probe failure) it keeps the
+    bare-http fallback: a doomed proxy is never spawned, and the raw entry
+    stays visible/diagnosable instead of silently vanishing. Scoped to
+    streamable HTTP only — an `auth: oauth` + `transport: sse` entry keeps
+    the raw sse emission until the proxy grows an SSE client path.
     """
     try:
         from hermes_cli.tools_config import _parse_enabled_flag
@@ -376,8 +407,26 @@ def _build_external_mcp_configs() -> dict[str, dict[str, Any]]:
             if not _parse_enabled_flag(cfg.get("enabled", True), default=True):
                 continue
             url = cfg.get("url")
+            is_oauth = (cfg.get("auth") or "").lower().strip() == "oauth"
             if url and cfg.get("transport") == "sse":
                 entry: dict[str, Any] = {"type": "sse", "url": url}
+            elif url and is_oauth:
+                try:
+                    has_tokens = _has_oauth_tokens(name)
+                except Exception:
+                    has_tokens = False
+                if has_tokens:
+                    out[name] = {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [
+                            "-m", "agent.transports.oauth_mcp_proxy",
+                            "--server", name,
+                        ],
+                        "env": _mcp_subprocess_env(),
+                    }
+                    continue
+                entry = {"type": "http", "url": url}
             elif url:
                 entry = {"type": "http", "url": url}
             elif cfg.get("command"):
