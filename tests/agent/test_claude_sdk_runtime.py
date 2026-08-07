@@ -2538,9 +2538,32 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["research done: Tupã wins"]
+        assert got == [["research done: Tupã wins"]]
         # Observability unchanged: the counter still ticks.
         assert session._unsolicited_results == 1
+
+    def test_bg_burst_delivers_all_buffered_assistant_messages(self):
+        # ×5 incident 2026-08-06: five out-of-turn AssistantMessages were
+        # buffered, the terminal ResultMessage carried its own text, and the
+        # intermediate "Research landed…" message was silently discarded —
+        # only the terminal report reached the callback. The full burst must
+        # arrive as an ordered list, result text deduped against the last
+        # buffered entry.
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(
+                AssistantMessage(
+                    content=[TextBlock("Research landed — writing up.")]
+                ),
+                AssistantMessage(content=[TextBlock("the full report")]),
+                ResultMessage(result="the full report", uuid="burst-1"),
+            )
+            assert self._wait(lambda: got)
+        finally:
+            session.close()
+        assert got == [["Research landed — writing up.", "the full report"]]
 
     def test_falls_back_to_buffered_assistant_text(self):
         # Some CLI results arrive with result=None; the assistant text blocks
@@ -2556,7 +2579,7 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["the long answer body"]
+        assert got == [["the long answer body"]]
 
     def test_result_uuid_deduplicated(self):
         got = []
@@ -2569,7 +2592,7 @@ class TestUnsolicitedDelivery:
             self._wait(lambda: len(got) >= 2, timeout=0.5)
         finally:
             session.close()
-        assert got == ["answer"]
+        assert got == [["answer"]]
 
     def test_subagent_text_excluded_from_buffer(self):
         # parent_tool_use_id set = subagent stream noise — same gate the
@@ -2588,7 +2611,7 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["top-level answer"]
+        assert got == [["top-level answer"]]
 
     def test_no_callback_keeps_drop_semantics(self):
         # Without a wired callback the historical WARN+counter drop stands
@@ -2665,7 +2688,7 @@ class TestBackgroundDeliveryWiring:
         )
         callback = captured.get("on_unsolicited_result")
         assert callback is not None, "flag defaults ON — callback must be wired"
-        callback("background answer text")
+        callback(["background answer text"])
         assert len(events) == 1
         evt = events[0]
         assert evt["type"] == "async_delegation"

@@ -377,7 +377,7 @@ class ClaudeAgentSdkSession:
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
-        on_unsolicited_result: Optional[Callable[[str], None]] = None,
+        on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -753,10 +753,10 @@ class ClaudeAgentSdkSession:
         These are real CLI output (typically a finished background Agent task
         reporting in). They answer nothing Hermes asked, so they must never
         enter a turn's result — but their CONTENT is completed work the user
-        is waiting on: with a delivery callback wired, capture the top-level
-        assistant text and hand the assembled answer over on the terminal
-        ResultMessage (uuid-deduped). Without a callback, the historical
-        WARN-drop stands."""
+        is waiting on: with a delivery callback wired, capture each top-level
+        assistant message's text and hand the FULL burst over as an ordered
+        list on the terminal ResultMessage (uuid-deduped). Without a
+        callback, the historical WARN-drop stands."""
         if isinstance(message, _StreamEnd):
             return
         sid = getattr(message, "session_id", None)
@@ -783,15 +783,16 @@ class ClaudeAgentSdkSession:
                 )
                 return
             result_text = getattr(message, "result", None)
-            text = (
-                result_text
-                if isinstance(result_text, str) and result_text.strip()
-                else "\n".join(self._unsolicited_text).strip()
-            )
+            texts = list(self._unsolicited_text)
             self._unsolicited_text.clear()
+            if isinstance(result_text, str) and result_text.strip():
+                # The CLI's result text repeats the turn's final assistant
+                # message — never hand the same text over twice.
+                if not texts or texts[-1] != result_text:
+                    texts.append(result_text)
             if uuid:
                 self._unsolicited_delivered.add(uuid)
-            if not text:
+            if not texts:
                 logger.warning(
                     "claude-agent-sdk: unsolicited ResultMessage carried no "
                     "text (total=%d) — nothing to deliver",
@@ -799,30 +800,36 @@ class ClaudeAgentSdkSession:
                 )
                 return
             logger.info(
-                "claude-agent-sdk: delivering unsolicited result (background "
-                "task finished, total=%d, %d chars)",
-                self._unsolicited_results, len(text),
+                "claude-agent-sdk: delivering unsolicited result burst "
+                "(background task finished, total=%d, %d message(s), "
+                "%d chars)",
+                self._unsolicited_results, len(texts),
+                sum(len(t) for t in texts),
             )
             try:
-                self._on_unsolicited_result(text)
+                self._on_unsolicited_result(texts)
             except Exception:
                 logger.warning(
                     "claude-agent-sdk: unsolicited-result delivery callback "
                     "raised — answer may be lost", exc_info=True,
                 )
         elif name == "AssistantMessage":
-            # Buffer top-level text as the fallback answer body; subagent
-            # streams (parent_tool_use_id set) are noise — the same gate
+            # Buffer top-level text, one entry per message so the burst
+            # delivers in message granularity; subagent streams
+            # (parent_tool_use_id set) are noise — the same gate
             # _forward_stream_delta uses.
             if (
                 self._on_unsolicited_result is not None
                 and not getattr(message, "parent_tool_use_id", None)
             ):
-                for block in getattr(message, "content", None) or []:
-                    if type(block).__name__ == "TextBlock":
-                        block_text = getattr(block, "text", "") or ""
-                        if block_text:
-                            self._unsolicited_text.append(block_text)
+                parts = [
+                    getattr(block, "text", "") or ""
+                    for block in getattr(message, "content", None) or []
+                    if type(block).__name__ == "TextBlock"
+                ]
+                message_text = "\n".join(p for p in parts if p)
+                if message_text:
+                    self._unsolicited_text.append(message_text)
             logger.info(
                 "claude-agent-sdk: unsolicited %s outside a turn", name,
             )

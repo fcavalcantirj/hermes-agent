@@ -597,12 +597,13 @@ def run_claude_agent_sdk_turn(
             _bg_parent_session_id = getattr(agent, "session_id", None)
             _bg_model = getattr(agent, "model", None)
 
-            def _deliver_background_result(text: str) -> None:
+            def _deliver_background_result(texts: list[str]) -> None:
                 try:
                     import time as _time
 
                     from tools.process_registry import process_registry
 
+                    text = "\n\n".join(texts)
                     # Directive header, learned live (2026-07-29): the shared
                     # completion template is permissive ("you may have moved
                     # on"), and a long-context model answered it with a
