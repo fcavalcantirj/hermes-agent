@@ -42,10 +42,22 @@ def _isolate_provider_config(monkeypatch):
     metered-billing refusal assertions, and a real `append_file` would leak into
     the system-prompt tests. Default to an empty block; tests that care patch
     `load_config_readonly` themselves (the last patch wins).
+
+    Same hermeticity for the external-MCP merge: build_option_fields() reads
+    config.yaml's `mcp_servers:` through the session module's
+    `_load_mcp_config` seam, so without this stub EVERY test that builds
+    options would pull the developer's real slack/notion servers into
+    `mcp_servers`. Stub the seam to an empty catalog; the external-merge
+    tests override it per-test. raising=False because the seam does not
+    exist until the merge is implemented (RED phase).
     """
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
     import hermes_cli.config as cfg
 
     monkeypatch.setattr(cfg, "load_config_readonly", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(
+        sdk_session_mod, "_load_mcp_config", lambda *a, **k: {}, raising=False
+    )
 
 
 # ---------- SDK stand-in types (duck-typed by class NAME) ----------
@@ -577,6 +589,172 @@ class TestSession:
         turn = session.run_turn("hi")
         assert turn.should_retire
         assert "ANTHROPIC_API_KEY" in (turn.error or "")
+
+
+# ---------- external MCP servers from config.yaml (mcp_servers:) ----------
+
+
+def _patch_external_mcp(monkeypatch, servers):
+    """Point the session module's config.yaml `mcp_servers:` seam at `servers`.
+
+    raising=False on purpose: pre-fix the seam does not exist yet, and these
+    tests must go RED on the MISSING MERGE (the assertions below), never on
+    monkeypatch plumbing."""
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+    monkeypatch.setattr(
+        sdk_session_mod,
+        "_load_mcp_config",
+        lambda *a, **k: dict(servers),
+        raising=False,
+    )
+
+
+class TestExternalMcpServers:
+    """config.yaml `mcp_servers:` entries must reach the SDK's mcp_servers
+    dict. Today build_option_fields() registers ONLY the internal
+    hermes-tools wrapper, so every external server (slack stdio, notion
+    remote, ...) is silently invisible to the model on this runtime — the
+    tools work on the native path and vanish on the fallback."""
+
+    def test_enabled_stdio_server_merged(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "slack": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-slack"],
+                "env": {"SLACK_BOT_TOKEN": "xoxb-fake"},
+            },
+        })
+        session, _ = _make_session()
+        fields = session.build_option_fields()
+        assert fields["mcp_servers"]["slack"] == {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-slack"],
+            "env": {"SLACK_BOT_TOKEN": "xoxb-fake"},
+        }
+        # The internal wrapper still rides along untouched.
+        assert "hermes-tools" in fields["mcp_servers"]
+
+    def test_disabled_server_excluded(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "slack": {"command": "npx", "enabled": False},
+            "notion": {"url": "https://mcp.notion.com/mcp"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "slack" not in servers
+        assert "notion" in servers  # the sibling stays — no over-filtering
+
+    def test_enabled_flag_stringy(self, monkeypatch):
+        # config.yaml booleans arrive in every YAML spelling; membership
+        # follows _parse_enabled_flag semantics (missing/unrecognized = on).
+        _patch_external_mcp(monkeypatch, {
+            "off-string": {"command": "a", "enabled": "false"},
+            "off-zero": {"command": "b", "enabled": 0},
+            "on-string": {"command": "c", "enabled": "yes"},
+            "on-default": {"command": "d"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "off-string" not in servers
+        assert "off-zero" not in servers
+        assert "on-string" in servers
+        assert "on-default" in servers
+
+    def test_http_server_shape(self, monkeypatch):
+        # A remote OAuth server (notion) cannot authenticate under this
+        # fallback (the SDK-spawned CLI cannot read Hermes' stored OAuth
+        # tokens) — but it must still emit a VALID http config, never crash
+        # the build or corrupt sibling servers. Hermes-only keys (auth,
+        # timeout, ...) are not forwarded to the SDK.
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"] == {
+            "type": "http",
+            "url": "https://mcp.notion.com/mcp",
+        }
+
+    def test_sse_server_shape(self, monkeypatch):
+        # transport: sse + url wins over the plain-http mapping — the same
+        # precedence the native MCPServerTask transport selection applies.
+        _patch_external_mcp(monkeypatch, {
+            "events": {"url": "https://example.com/sse", "transport": "sse"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["events"] == {
+            "type": "sse",
+            "url": "https://example.com/sse",
+        }
+
+    def test_http_headers_passed_through(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "api": {
+                "url": "https://api.example.com/mcp",
+                "headers": {"Authorization": "Bearer tok-1"},
+            },
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["api"] == {
+            "type": "http",
+            "url": "https://api.example.com/mcp",
+            "headers": {"Authorization": "Bearer tok-1"},
+        }
+
+    def test_reserved_name_not_overridden(self, monkeypatch):
+        # A config.yaml entry named hermes-tools must never displace the
+        # internal wrapper — the wrapper is set LAST and wins on collision.
+        _patch_external_mcp(monkeypatch, {
+            "hermes-tools": {"command": "/usr/bin/evil", "args": ["--pwn"]},
+            "slack": {"command": "npx"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["hermes-tools"]["command"] != "/usr/bin/evil"
+        assert servers["hermes-tools"]["args"] == [
+            "-m", "agent.transports.hermes_tools_mcp_server",
+        ]
+        assert "slack" in servers  # the benign sibling still merges
+
+    def test_include_hermes_tools_false_still_lists_external(self, monkeypatch):
+        # include_hermes_tools=False drops ONLY the internal wrapper; the
+        # operator's own servers are independent of that switch.
+        _patch_external_mcp(monkeypatch, {"slack": {"command": "npx"}})
+        session, _ = _make_session(include_hermes_tools=False)
+        servers = session.build_option_fields()["mcp_servers"]
+        assert "hermes-tools" not in servers
+        assert "slack" in servers
+
+    def test_malformed_entry_skipped(self, monkeypatch):
+        # Neither url nor command → nothing to launch; a non-dict entry is
+        # config noise. Both are skipped without dragging down siblings.
+        _patch_external_mcp(monkeypatch, {
+            "broken": {"timeout": 30},
+            "not-a-dict": "https://example.com/mcp",
+            "ok": {"command": "srv"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "broken" not in servers
+        assert "not-a-dict" not in servers
+        assert servers["ok"] == {
+            "type": "stdio", "command": "srv", "args": [], "env": {},
+        }
+
+    def test_external_config_failure_is_soft(self, monkeypatch):
+        # An unreadable/corrupt config must never take the session down —
+        # the merge degrades to the internal wrapper alone.
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(
+            sdk_session_mod, "_load_mcp_config", _boom, raising=False
+        )
+        session, _ = _make_session()
+        fields = session.build_option_fields()  # must not raise
+        assert set(fields["mcp_servers"]) == {"hermes-tools"}
+        # The helper itself is the soft-failure boundary: {} on any error.
+        assert sdk_session_mod._build_external_mcp_configs() == {}
 
 
 # ---------- runtime glue ----------
@@ -2233,6 +2411,22 @@ class TestSystemPromptAppend:
         out = build_system_prompt_append()
         assert out is not None
         assert "session_search" in out
+
+    def test_system_prompt_steers_to_hermes_skill_tool(self, tmp_path, monkeypatch):
+        # Gap 2: on this runtime the model's BUILT-IN Skill tool resolves the
+        # Claude-Code-bundled catalog, NOT Hermes' skill library — a genuine
+        # Hermes skill comes back "Unknown skill". Hermes skills are only
+        # reachable through the hermes-tools shims (skills_list/skill_view),
+        # so the append must steer explicitly, and must do so even on a box
+        # whose skills index renders empty (the steering is about the TOOLS,
+        # not the catalog contents).
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append() or ""
+        assert "skills_list" in out
+        assert "skill_view" in out
+        assert "Do NOT use the built-in Skill tool" in out
 
 
 class TestAuxLaneFailClosed:

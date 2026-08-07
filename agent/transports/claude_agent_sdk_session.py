@@ -346,6 +346,59 @@ def _build_hermes_tools_mcp_config(
     }
 
 
+def _load_mcp_config() -> dict[str, Any]:
+    """config.yaml `mcp_servers:` entries, security-filtered and
+    env-interpolated (tools.mcp_tool._load_mcp_config). Module-level name so
+    tests can stub it; lazy import because tools.mcp_tool is heavy."""
+    from tools.mcp_tool import _load_mcp_config as _real_load
+
+    return _real_load()
+
+
+_RESERVED_MCP_KEYS = frozenset({"hermes-tools"})
+
+
+def _build_external_mcp_configs() -> dict[str, dict[str, Any]]:
+    """Convert enabled config.yaml mcp_servers entries into SDK-typed configs.
+
+    Known accepted caveat: a remote `auth: oauth` server (e.g. Notion) emits
+    a valid http config here but won't actually authenticate under this
+    fallback, because the SDK-spawned CLI can't read Hermes's own OAuth
+    token store. Expected/acceptable, not a bug to fix here.
+    """
+    try:
+        from hermes_cli.tools_config import _parse_enabled_flag
+
+        out: dict[str, dict[str, Any]] = {}
+        for name, cfg in (_load_mcp_config() or {}).items():
+            if name in _RESERVED_MCP_KEYS or not isinstance(cfg, dict):
+                continue
+            if not _parse_enabled_flag(cfg.get("enabled", True), default=True):
+                continue
+            url = cfg.get("url")
+            if url and cfg.get("transport") == "sse":
+                entry: dict[str, Any] = {"type": "sse", "url": url}
+            elif url:
+                entry = {"type": "http", "url": url}
+            elif cfg.get("command"):
+                entry = {
+                    "type": "stdio",
+                    "command": cfg["command"],
+                    "args": list(cfg.get("args") or []),
+                    "env": dict(cfg.get("env") or {}),
+                }
+            else:
+                continue  # malformed: nothing to launch
+            headers = cfg.get("headers")
+            if headers and entry["type"] in ("http", "sse"):
+                entry["headers"] = dict(headers)
+            out[name] = entry
+        return out
+    except Exception:
+        logger.debug("external MCP config merge failed", exc_info=True)
+        return {}
+
+
 class _StreamEnd:
     """Reader-loop sentinel: the SDK message stream ended (CLI exited or the
     transport tore down). Routed to the in-flight turn so it fails fast and
@@ -945,7 +998,9 @@ class ClaudeAgentSdkSession:
     def build_option_fields(self) -> dict[str, Any]:
         """The ClaudeAgentOptions field dict — plain data so tests can assert
         on it without importing the SDK."""
-        mcp_servers: dict[str, Any] = {}
+        # External servers first; the internal wrapper is set LAST so it
+        # always wins a name collision with a config.yaml entry.
+        mcp_servers: dict[str, Any] = _build_external_mcp_configs()
         if self._include_hermes_tools:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id

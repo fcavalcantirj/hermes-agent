@@ -75,6 +75,17 @@ _SEARCH_QUERY_ADDENDUM = (
     "Prefer one or two distinctive words; join alternatives with OR."
 )
 
+# The claude_code preset ships its own built-in Skill tool, which on this
+# runtime resolves the Claude-Code-bundled catalog — NOT Hermes' skill
+# library, so a genuine Hermes skill comes back "Unknown skill". Hermes
+# skills are only reachable through the hermes-tools shims.
+_SKILL_CATALOG_STEERING = (
+    "Hermes skills are served by the hermes-tools MCP server: discover them "
+    "with skills_list and load one with skill_view(name=...). Do NOT use the "
+    "built-in Skill tool for Hermes skills — on this runtime it resolves a "
+    "different, smaller catalog and will report them as unknown."
+)
+
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
     return (
@@ -223,6 +234,8 @@ def build_system_prompt_append(
         blocks.append(SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM)
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
+
+    blocks.append(_SKILL_CATALOG_STEERING)
 
     # Skills index for the read-side tools, filtered to the honest
     # MCP-exposed surface. `memory` joins only when the shim is actually
