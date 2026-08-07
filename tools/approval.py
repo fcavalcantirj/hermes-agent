@@ -2347,6 +2347,13 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
+        # Turn teardown: the prompt dies with the turn. Mark it EXPLICITLY
+        # expired — signaling with an unset result let every wait-loop
+        # consumer read it as a deny, fabricating user-attributed denials
+        # for prompts nobody answered (observed 08-04 and 08-06). A result
+        # that raced in ahead of teardown is kept.
+        if entry.result is None:
+            entry.result = "expired"
         entry.event.set()
 
 
@@ -2549,11 +2556,16 @@ def build_sdk_gateway_approval_callback(context_provider=None):
                 "reason": "approval timed out — no operator response",
             }
         choice = decision.get("choice")
-        if choice is None:
-            # Turn teardown resolved the wait without a result. Existing
-            # behavior (plain deny → "denied by user") KEPT verbatim —
-            # teardown-as-expired semantics are W11's item, not this one.
-            return "deny"
+        if choice in (None, "expired"):
+            # Turn teardown expired this prompt before anyone answered.
+            # Honest attribution through the widened channel — the model
+            # must never hear "denied by user" for a prompt that simply
+            # died with the turn. (None is defensive residue: teardown now
+            # always stamps "expired".)
+            return {
+                "choice": "deny",
+                "reason": "approval expired (turn ended)",
+            }
         if choice == "deny":
             reason = decision.get("reason")
             if reason:
@@ -3390,15 +3402,21 @@ def _run_approval_gate(
             choice = decision["choice"]
             deny_reason = decision.get("reason")
 
-            if not resolved or choice is None or choice == "deny":
+            if not resolved or choice in (None, "deny", "expired"):
                 if not resolved:
                     reason = "timed out without user response"
+                    timeout_addendum = " Silence is not consent."
+                elif choice in (None, "expired"):
+                    # Turn teardown expired the prompt before anyone
+                    # answered — honest attribution; still not consent.
+                    reason = ("approval expired when the turn ended, "
+                              "before the user responded")
                     timeout_addendum = " Silence is not consent."
                 else:
                     reason = "denied by user"
                     timeout_addendum = ""
                 reason_addendum = ""
-                if resolved and deny_reason:
+                if resolved and choice == "deny" and deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
                 return {
                     "approved": False,
@@ -4121,16 +4139,23 @@ def check_all_command_guards(command: str, env_type: str,
             choice = decision["choice"]
             deny_reason = decision.get("reason")
 
-            if not resolved or choice is None or choice == "deny":
+            if not resolved or choice in (None, "deny", "expired"):
                 # Consent contract: silence is NOT consent, and an explicit
                 # deny is also a hard halt — both produce a BLOCKED outcome
                 # that names the agent's most common evasion paths (retry,
                 # rephrase, achieve the same outcome via a different command).
-                # See issue #24912 for the original incident.
+                # See issue #24912 for the original incident. An "expired"
+                # result (turn teardown) is equally non-consent — honest
+                # attribution, same hard halt.
                 if not resolved:
                     reason = "timed out without user response"
                     timeout_addendum = " Silence is not consent."
                     outcome = "timeout"
+                elif choice in (None, "expired"):
+                    reason = ("approval expired when the turn ended, "
+                              "before the user responded")
+                    timeout_addendum = " Silence is not consent."
+                    outcome = "expired"
                 else:
                     reason = "denied by user"
                     timeout_addendum = ""
@@ -4490,9 +4515,22 @@ def check_execute_code_guard(code: str, env_type: str,
     choice = decision["choice"]
     deny_reason = decision.get("reason")
 
-    if not resolved or choice is None or choice == "deny":
-        reason = "timed out without user response" if not resolved else "denied by user"
-        addendum = " Silence is not consent." if not resolved else ""
+    if not resolved or choice in (None, "deny", "expired"):
+        if not resolved:
+            reason = "timed out without user response"
+            addendum = " Silence is not consent."
+            outcome = "timeout"
+        elif choice in (None, "expired"):
+            # Turn teardown expired the prompt before anyone answered —
+            # honest attribution; still not consent.
+            reason = ("approval expired when the turn ended, before the "
+                      "user responded")
+            addendum = " Silence is not consent."
+            outcome = "expired"
+        else:
+            reason = "denied by user"
+            addendum = ""
+            outcome = "denied"
         reason_addendum = ""
         if resolved and choice == "deny" and deny_reason:
             reason_addendum = f' Reason given by the user: "{deny_reason}".'
@@ -4507,7 +4545,7 @@ def check_execute_code_guard(code: str, env_type: str,
             ),
             "pattern_key": pattern_key,
             "description": description,
-            "outcome": "timeout" if not resolved else "denied",
+            "outcome": outcome,
             "user_consent": False,
             "deny_reason": deny_reason,
         }
@@ -4595,6 +4633,10 @@ def request_elicitation_consent(
         choice = decision.get("choice")
         if choice in ("once", "session", "always"):
             return "accept"
+        if choice == "expired":
+            # Turn teardown expired the prompt unanswered — mirror the
+            # unresolved/timeout outcome ("cancel"), not a user decline.
+            return "cancel"
         return "decline"
 
     # CLI / TUI path. allow_permanent=False because elicitation is a

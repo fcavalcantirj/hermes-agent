@@ -2703,6 +2703,41 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.unregister_gateway_notify(sk)
 
+    def test_teardown_resolves_inflight_prompts_as_expired(self, monkeypatch):
+        # Incident defect 2 (observed 08-04 and 08-06): turn teardown
+        # signaled the blocked approval wait with an UNSET result; the
+        # bridge read that as a deny and the model heard "denied by user"
+        # for a prompt nobody answered. Teardown now stamps "expired" and
+        # the SDK lane carries the honest reason.
+        sk = "sess-teardown"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            # Paged but never answered — the prompt is in flight when the
+            # turn tears down.
+            approval_mod.register_gateway_notify(sk, lambda data: None)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Bash(x)", "desc"))
+            )
+            t.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with approval_mod._lock:
+                    if approval_mod._gateway_queues.get(sk):
+                        break
+                time.sleep(0.01)
+            approval_mod.unregister_gateway_notify(sk)
+            t.join(timeout=10)
+            assert out.get("r") == {
+                "choice": "deny",
+                "reason": "approval expired (turn ended)",
+            }
+            assert "denied by user" not in str(out.get("r"))
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
     def test_tool_use_id_threads_from_context_to_approval_data(
         self, monkeypatch,
     ):

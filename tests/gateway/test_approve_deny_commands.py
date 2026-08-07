@@ -208,6 +208,30 @@ class TestBlockingGatewayApproval:
             for r in caplog.records
         ), "the FIFO fallback must be logged with session + pending count"
 
+    def test_unregister_sets_explicit_expired_result(self):
+        """W11: turn teardown stamps pending entries "expired" — signaling
+        with an unset result let wait loops read teardown as a deny,
+        fabricating user-attributed denials for prompts nobody answered.
+        A result that raced in ahead of teardown is kept."""
+        from tools.approval import (
+            register_gateway_notify, unregister_gateway_notify,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-teardown-expired"
+        register_gateway_notify(session_key, lambda d: None)
+        pending = _ApprovalEntry({"command": "a"})
+        raced = _ApprovalEntry({"command": "b"})
+        raced.result = "once"  # resolved just before teardown
+        _gateway_queues[session_key] = [pending, raced]
+
+        unregister_gateway_notify(session_key)
+
+        assert pending.event.is_set()
+        assert pending.result == "expired"
+        assert raced.event.is_set()
+        assert raced.result == "once"
+        assert session_key not in _gateway_queues
+
     def test_unknown_tool_use_id_resolves_nothing(self):
         """A tap whose correlator matches nothing pending (already resolved
         or expired) resolves ZERO entries — never queue[0]; the stale-tap
