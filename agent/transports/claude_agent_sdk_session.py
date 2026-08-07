@@ -954,6 +954,12 @@ class ClaudeAgentSdkSession:
             # back in via agent.claude_agent_sdk.setting_sources — see
             # _configured_setting_sources.
             "setting_sources": _configured_setting_sources(),
+            # Hermes has no AskUserQuestion answer channel: a tap approves the
+            # tool but the chosen option never reaches the CLI, so the tool
+            # dead-ends with "The user did not answer the questions." The model
+            # must ask in plain text (Telegram-compatible); full option-button
+            # mapping is a later feature.
+            "disallowed_tools": ["AskUserQuestion"],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id

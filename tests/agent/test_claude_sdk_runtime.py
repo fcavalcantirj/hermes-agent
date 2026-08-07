@@ -432,6 +432,13 @@ class TestSession:
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
+    def test_askuserquestion_in_disallowed_tools(self):
+        # No answer channel for AskUserQuestion in hermes — the model must
+        # ask in plain text; the tool is removed from its context.
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        fields = session.build_option_fields()
+        assert fields["disallowed_tools"] == ["AskUserQuestion"]
+
     def test_config_permission_mode_overrides_env_mapping(self, monkeypatch):
         # agent.claude_agent_sdk.permission_mode (an SDK literal) wins over
         # the HERMES_TERMINAL_SECURITY_MODE mapping; explicit constructor
