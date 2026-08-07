@@ -548,6 +548,22 @@ class ClaudeAgentSdkSession:
             result.fatal_reason = "auth" if hint else "startup"
             return result
 
+        # Text buffered before this turn whose terminal ResultMessage never
+        # arrived is partial mid-burst content — a later unrelated result
+        # must never pick it up (misattribution is the proven worse failure;
+        # texts parked DURING the turn re-buffer via the residue drain and
+        # are unaffected). Never a silent drop: WARN what is discarded.
+        stale = list(self._unsolicited_text)
+        if stale:
+            self._unsolicited_text.clear()
+            logger.warning(
+                "claude-agent-sdk: discarding %d stale unsolicited text(s) "
+                "(%d chars) buffered before this turn — their terminal "
+                "ResultMessage never arrived; attaching them to a later "
+                "unrelated result is the proven worse failure",
+                len(stale), sum(len(t) for t in stale),
+            )
+
         # An interrupt that arrived between turns or during connect (up to
         # 60s) targets THIS turn — honor it instead of erasing it. (The old
         # unconditional clear() silently swallowed that window.)
@@ -695,9 +711,36 @@ class ClaudeAgentSdkSession:
             # Anything the reader parked after our ResultMessage belongs to a
             # CLI-initiated turn that overlapped ours. Route it now — left in
             # a discarded queue it would be lost, and left in the stream it
-            # would become the next turn's answer.
+            # would become the next turn's answer. EXCEPT a residue result
+            # that repeats THIS turn's own answer: delivering it through the
+            # background lane re-presents the agent's own text as a fake
+            # completion (the 2026-08-06 echo class) — suppress it, dedup-mark
+            # it, and consume its burst buffer. Genuinely different residue is
+            # a real background completion and still delivers.
+            final_norm = " ".join(str(out["final_text"]).split())
             while not inbox.empty():
-                self._handle_unsolicited(inbox.get_nowait())
+                residue = inbox.get_nowait()
+                if final_norm and type(residue).__name__ == "ResultMessage":
+                    res_text = getattr(residue, "result", None)
+                    if (
+                        isinstance(res_text, str)
+                        and " ".join(res_text.split()) == final_norm
+                    ):
+                        uuid = getattr(residue, "uuid", None)
+                        if uuid:
+                            self._unsolicited_delivered.add(uuid)
+                        self._unsolicited_results += 1
+                        buffered = len(self._unsolicited_text)
+                        self._unsolicited_text.clear()
+                        logger.warning(
+                            "claude-agent-sdk: residue ResultMessage %s "
+                            "matches this turn's own answer — suppressed, "
+                            "never delivered as a background result "
+                            "(%d buffered text(s) consumed)",
+                            uuid, buffered,
+                        )
+                        continue
+                self._handle_unsolicited(residue)
         return out
 
     # ---------- stream ownership ----------

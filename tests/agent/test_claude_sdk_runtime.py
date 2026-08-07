@@ -11,6 +11,7 @@ retire the client rather than silently continue.
 """
 
 import asyncio
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -937,7 +938,17 @@ class TestStreamOwnership:
         # not served as the next turn's answer. (Mid-flight overlap — the one
         # window the idle-time tests above don't cover. Ported from the
         # independent re-derivation of this fix, commit 09537f965.)
+        #
+        # Updated pin (2026-08-07): the original version routed ALL residue
+        # to the background-delivery lane with no content discrimination —
+        # which ships a turn's OWN answer as a fake background completion,
+        # the 2026-08-06 incident class. New intent: residue never becomes
+        # the next turn's answer (unchanged) AND the delivery lane splits by
+        # content — genuinely different residue (this test) still delivers
+        # as a background burst; own-answer residue is suppressed (see
+        # test_own_answer_residue_never_delivered_as_background_result).
         holder = {}
+        got = []
 
         class OverlappingClient(_FakeClient):
             async def query(self, text):
@@ -958,7 +969,9 @@ class TestStreamOwnership:
             holder["client"] = client
             return client
 
-        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
         try:
             first = session.run_turn("one", turn_timeout=15.0)
             assert first.final_text == "FIRST"
@@ -969,6 +982,141 @@ class TestStreamOwnership:
         finally:
             session.close()
         assert second.final_text == "SECOND"
+        # Delivery split: differing residue is a REAL background completion —
+        # it must still reach the delivery lane, not be swallowed.
+        assert got == [["RESIDUE from an overlapping CLI turn"]]
+
+    def test_own_answer_residue_never_delivered_as_background_result(
+        self, caplog
+    ):
+        # D2 rework (2026-08-06 incident class): a residue ResultMessage that
+        # repeats the just-finished turn's OWN answer must be suppressed —
+        # dedup-marked and WARN'd, never handed to the background-delivery
+        # callback as a fake completion.
+        holder = {}
+        got = []
+
+        class OwnEchoClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                if len(self.queried) == 1:
+                    self._pending.append(ResultMessage(result="FIRST", uuid="f-1"))
+                    self._pending.append(
+                        ResultMessage(result="FIRST", uuid="own-dup")
+                    )
+                else:
+                    self._pending.append(ResultMessage(result="SECOND", uuid="s-1"))
+
+        def factory(options=None):
+            client = OwnEchoClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="agent.transports.claude_agent_sdk_session"
+        ):
+            try:
+                first = session.run_turn("one", turn_timeout=15.0)
+                assert first.final_text == "FIRST"
+                # run_turn returns only after the residue drain — the
+                # suppression already happened; a bounded wait just proves
+                # nothing arrives late either.
+                self._wait(lambda: got, timeout=0.5)
+                second = session.run_turn("two", turn_timeout=15.0)
+            finally:
+                session.close()
+        assert got == [], "own-answer residue was delivered as a fake background result"
+        assert second.final_text == "SECOND"
+        assert session._unsolicited_results == 1  # routed away, still counted
+        assert "own-dup" in session._unsolicited_delivered
+        assert any(
+            "matches this turn's own answer" in r.getMessage()
+            for r in caplog.records
+        ), "suppression must WARN, never silently drop"
+
+    def test_genuine_overlap_residue_still_delivers_as_burst(self):
+        # The delivery split's other half, explicit: residue with DIFFERENT
+        # content is deliver_background_results working — never suppressed.
+        holder = {}
+        got = []
+
+        class OverlapClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                self._pending.append(ResultMessage(result="FIRST", uuid="f-1"))
+                self._pending.append(
+                    ResultMessage(result="DIFFERENT bg completion", uuid="bg-9")
+                )
+
+        def factory(options=None):
+            client = OverlapClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
+        try:
+            first = session.run_turn("one", turn_timeout=15.0)
+            assert first.final_text == "FIRST"
+            assert self._wait(lambda: got, timeout=5.0)
+        finally:
+            session.close()
+        assert got == [["DIFFERENT bg completion"]]
+
+    def test_stale_unsolicited_text_never_attaches_to_later_result(
+        self, caplog
+    ):
+        # Leak fix: text buffered idle-time whose terminal ResultMessage never
+        # arrived is discarded (with WARN) at the next turn's start — a later
+        # unrelated result must never pick it up as its own burst.
+        got = []
+        session, holder = _make_session(
+            script=[
+                AssistantMessage(content=[TextBlock("fresh answer")]),
+                ResultMessage(result="fresh answer", uuid="fresh-1"),
+            ],
+            on_unsolicited_result=got.append,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="agent.transports.claude_agent_sdk_session"
+        ):
+            try:
+                session.ensure_started()
+                # A background turn started streaming but its result never
+                # came (CLI died / mid-burst) — text sits in the buffer.
+                holder["client"].feed(
+                    AssistantMessage(content=[TextBlock("orphaned partial text")])
+                )
+                assert self._wait(lambda: session._unsolicited_text)
+                turn = session.run_turn("new question", turn_timeout=15.0)
+                assert turn.final_text == "fresh answer"
+                # A later, unrelated background completion arrives idle-time.
+                holder["client"].feed(
+                    ResultMessage(result="unrelated bg answer", uuid="bg-x")
+                )
+                assert self._wait(lambda: got)
+            finally:
+                session.close()
+        assert got == [["unrelated bg answer"]], (
+            "stale pre-turn text misattached to an unrelated later result"
+        )
+        assert any(
+            "stale unsolicited text" in r.getMessage()
+            for r in caplog.records
+        ), "turn-start discard must WARN, never silently drop"
+
+    @staticmethod
+    def _wait(cond, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
 
     def test_stream_death_mid_turn_fails_fast_instead_of_hanging(self):
         # A script with no ResultMessage models the CLI dying mid-turn. The
