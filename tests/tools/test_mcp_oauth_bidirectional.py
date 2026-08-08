@@ -198,6 +198,99 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     await flow.aclose()
 
 
+@pytest.mark.asyncio
+async def test_hermes_provider_close_mid_flow_releases_lock(tmp_path, monkeypatch):
+    """Closing the wrapper mid-flow MUST NOT leave ``context.lock`` stuck.
+
+    The SDK holds ``self.context.lock`` (an ``anyio.Lock``) across both yield
+    points in ``oauth2.py``'s ``async_auth_flow`` — including the main
+    ``response = yield request`` our wrapper mirrors at its own ``yield
+    outgoing``. If the wrapper is torn down while suspended there (e.g. a
+    keepalive ``asyncio.wait_for(..., timeout=...)`` cancelling/closing it
+    mid-request) without forwarding the close to ``inner``, the inner
+    generator — and the lock it holds — is only cleaned up later by asyncgen
+    GC finalization running in an unrelated task. anyio's lock-ownership
+    check then fails on release, the exception is swallowed as an orphan
+    task exception, and the lock is left permanently acquired: every
+    subsequent auth flow for this server hangs forever on ``async with
+    self.context.lock``. This reproduced in production as a full gateway
+    event-loop freeze (watchdog force-restart) triggered by an MCP keepalive
+    reconnect.
+    """
+    import asyncio
+
+    import httpx
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="old_access",
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token="old_refresh",
+        )
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    metadata = OAuthClientMetadata(
+        redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+        client_name="Hermes Agent",
+    )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=metadata,
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+    req = httpx.Request("POST", "https://example.com/mcp")
+    flow = provider.async_auth_flow(req)
+
+    # Drive to the first yield — `inner` (and thus the wrapper) is now
+    # suspended *inside* `async with self.context.lock`.
+    outbound = await flow.__anext__()
+    assert outbound is not None
+    assert provider.context.lock.locked(), "lock must be held across the yield"
+
+    # Simulate an external cancel/close mid-flow (e.g. a keepalive timeout
+    # cancelling the in-flight request) instead of feeding a response back.
+    await flow.aclose()
+
+    assert not provider.context.lock.locked(), (
+        "closing the wrapper mid-flow must release context.lock, not just "
+        "drop it — otherwise every later auth flow for this server hangs "
+        "forever on `async with self.context.lock`"
+    )
+
+    # Prove it concretely: a fresh flow must be able to acquire the lock and
+    # reach its first yield without hanging.
+    req2 = httpx.Request("POST", "https://example.com/mcp")
+    flow2 = provider.async_auth_flow(req2)
+    outbound2 = await asyncio.wait_for(flow2.__anext__(), timeout=2.0)
+    assert outbound2 is not None
+    await flow2.aclose()
+
+
 async def _noop_redirect(_url: str) -> None:
     """Redirect handler that does nothing (won't be invoked in these tests)."""
     return None

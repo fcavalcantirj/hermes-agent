@@ -430,6 +430,35 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 return
+            finally:
+                # Forward close to `inner` so its cleanup runs *now*, in this
+                # task's context, instead of being deferred to asyncgen GC.
+                #
+                # The SDK holds `self.context.lock` (an anyio.Lock) across
+                # BOTH yield points in oauth2.py's async_auth_flow (the
+                # refresh-token yield and the main `response = yield
+                # request`). If our wrapper is torn down here for any reason
+                # other than the StopAsyncIteration above — most commonly the
+                # caller cancelling/closing us mid-flow, e.g. a keepalive
+                # `asyncio.wait_for(..., timeout=...)` firing while a request
+                # is in flight — `inner` stays suspended *inside* that lock
+                # with no one left to advance it. Without this explicit
+                # close, `inner` is only finalized later by the event loop's
+                # asyncgen shutdown hook, which runs in an unrelated task.
+                # anyio.Lock.release() checks that the current task is the
+                # owner, that check fails under the foreign context, and the
+                # release raises (swallowed as "Task exception was never
+                # retrieved") — leaving the lock permanently acquired. Every
+                # subsequent auth flow for this server then hangs forever on
+                # `async with self.context.lock`, wedging whatever awaits it.
+                try:
+                    await inner.aclose()
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.debug(
+                        "MCP OAuth '%s': inner auth_flow close failed "
+                        "(non-fatal): %s",
+                        self._hermes_server_name, exc,
+                    )
 
     return HermesMCPOAuthProvider
 
