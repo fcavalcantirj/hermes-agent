@@ -800,6 +800,17 @@ def run_claude_agent_sdk_turn(
                 continue
         break
 
+    # Interrupt handoff (codex_runtime parity, its ~739-746): capture BEFORE
+    # the consume below zeroes the agent flag — the result dict needs it, and
+    # without an "interrupted" key the gateway's queued-drain classifies an
+    # interrupted turn as a plain partial error and DELIVERS the abandoned
+    # turn's error text ("⚠️ Processing stopped… Try again", 2026-08-09
+    # barge-in incident) instead of discarding it via its interrupted branch.
+    _user_interrupted = bool(
+        getattr(turn, "interrupted", False)
+        and getattr(agent, "_interrupt_requested", False)
+    )
+
     if getattr(turn, "interrupted", False):
         # The interrupt was honored by THIS turn — consume the agent-level
         # flag so the next turn is not short-circuited by it.
@@ -890,6 +901,7 @@ def run_claude_agent_sdk_turn(
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
         "error": turn.error,
+        "interrupted": _user_interrupted,
         # Same persistence contract as the codex app-server path: we flushed
         # the projected rows ourselves, so the gateway must not re-write the
         # user turn (append_message has no dedup).

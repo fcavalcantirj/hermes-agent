@@ -697,10 +697,36 @@ class ClaudeAgentSdkSession:
                     subtype = getattr(message, "subtype", "") or ""
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", None) or []
-                        out["error"] = (
+                        err_text = (
                             f"SDK result error (subtype={subtype}): "
                             + ("; ".join(str(e) for e in errors) or subtype)
                         )
+                        # A turn WE interrupted before any assistant content
+                        # ends as is_error/error_during_execution in the CLI
+                        # ("[ede_diagnostic] result_type=user…") — that is the
+                        # interrupt being honored, not a failure; surfacing it
+                        # paged the operator with a false "Processing stopped"
+                        # (2026-08-09 barge-in incident). Mask ONLY that exact
+                        # shape, only when THIS turn's interrupt flag is set
+                        # (never a fresh event read — a late /stop must not
+                        # reclassify a genuine error), and only when no auth
+                        # needle is present (an auth failure must keep its
+                        # error + retire path regardless of interrupts).
+                        # A real transient failure colliding with an interrupt
+                        # re-fires next turn with no interrupt pending and
+                        # takes the honest path; the masked text is INFO-kept.
+                        if (
+                            interrupted
+                            and subtype == "error_during_execution"
+                            and classify_auth_failure(err_text) is None
+                        ):
+                            logger.info(
+                                "claude-agent-sdk: masked %s on requested "
+                                "interrupt (interrupt honored, not a "
+                                "failure): %s", subtype, err_text,
+                            )
+                        else:
+                            out["error"] = err_text
                     elif subtype not in ("", "success"):
                         # e.g. error_max_turns / error_max_budget_usd — surface
                         # honestly; the partial transcript is still projected.

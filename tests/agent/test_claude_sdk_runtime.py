@@ -3525,3 +3525,168 @@ class TestSdkBufferCap:
         finally:
             session.close()
         assert holder["client"].options["max_buffer_size"] == 10 * 1024 * 1024
+
+
+class TestBargeInInterruptHandoff:
+    """W22 (2026-08-09 barge-in incident): a mid-turn user message interrupts
+    the running turn; the CLI, aborted before any assistant content, returns
+    is_error/error_during_execution ("[ede_diagnostic] result_type=user…").
+    Two defects made that page the operator with a false "⚠️ Processing
+    stopped … Try again": the runtime result dict omitted the "interrupted"
+    key (codex_runtime and the native finalizer both return it — the gateway's
+    queued-drain needs it to discard, not deliver, the abandoned turn), and
+    the transport surfaced the CLI's interrupt-shaped error as a real error.
+    The honest error path must NOT weaken: unrequested EDE, auth-hinted
+    errors, and CLI death keep surfacing."""
+
+    def test_sdk_result_dict_carries_interrupted_key(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._session_db = None
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                agent._interrupt_requested = True  # barge-in mid-turn
+                return _make_turn(interrupted=True, final_text="",
+                                  projected_messages=[])
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert result["interrupted"] is True
+        assert result["partial"] is True
+
+    def test_uninterrupted_turn_reports_interrupted_false(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._session_db = None
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                return _make_turn()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert result["interrupted"] is False
+
+    def _ede_result(self):
+        return ResultMessage(
+            subtype="error_during_execution",
+            is_error=True,
+            errors=["[ede_diagnostic] result_type=user last_content_type=n/a "
+                    "stop_reason=null"],
+        )
+
+    def test_requested_interrupt_ede_masks_error_with_log(self, caplog):
+        import logging
+        holder = {}
+
+        class BargeInClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                holder["session"]._interrupt_event.set()
+                self._pending.append(ResultMessage(
+                    subtype="error_during_execution",
+                    is_error=True,
+                    errors=["[ede_diagnostic] result_type=user "
+                            "last_content_type=n/a stop_reason=null"],
+                ))
+
+        def factory(options=None):
+            client = BargeInClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        holder["session"] = session
+        try:
+            with caplog.at_level(
+                logging.INFO, logger="agent.transports.claude_agent_sdk_session"
+            ):
+                turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.interrupted is True
+        assert turn.error is None
+        assert turn.should_retire is False
+        assert any("masked error_during_execution" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_unrequested_ede_stays_an_error(self):
+        session, _ = _make_session(script=[self._ede_result()])
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "error_during_execution" in turn.error
+
+    def test_auth_hint_in_ede_outranks_interrupt_mask(self):
+        holder = {}
+
+        class AuthFailBargeIn(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                holder["session"]._interrupt_event.set()
+                self._pending.append(ResultMessage(
+                    subtype="error_during_execution",
+                    is_error=True,
+                    errors=["401 unauthorized: oauth token has expired"],
+                ))
+
+        def factory(options=None):
+            client = AuthFailBargeIn(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        holder["session"] = session
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert turn.should_retire is True
+
+    def test_stream_end_during_interrupt_stays_an_error(self):
+        holder = {}
+
+        class DyingClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                holder["session"]._interrupt_event.set()
+                # no ResultMessage — the CLI dies; the reader sees stream end
+
+        def factory(options=None):
+            client = DyingClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        holder["session"] = session
+        try:
+            turn = session.run_turn("hi", turn_timeout=10.0)
+        finally:
+            session.close()
+        assert turn.error is not None
