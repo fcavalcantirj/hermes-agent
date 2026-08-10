@@ -4059,6 +4059,61 @@ class TestTurnLifetime:
         assert turn.final_text == "written"
 
 
+class TestDeadStreamRetires:
+    """A dead SDK stream is permanent on the session object (_stream_ended
+    never resets, ensure_started returns early while _client is set) — so a
+    non-retiring stream-death error poisons EVERY later turn into an instant
+    zero-model-call failure. RED pre-fix: both shapes returned
+    should_retire=False (retire fired only on auth hints)."""
+
+    def test_stream_death_mid_turn_retires(self):
+        # Base fake: a script with no ResultMessage models the CLI dying
+        # mid-turn (_EOS ends the stream).
+        session, holder = _make_session(
+            script=[AssistantMessage(content=[TextBlock("partial")])]
+        )
+        try:
+            turn = session.run_turn("hi", watch_poll_interval=0.02)
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "stream ended" in turn.error
+        assert turn.should_retire is True
+
+    def test_dead_stream_short_circuit_retires(self):
+        # The POISONED-SESSION half: a second turn on the same object
+        # short-circuits pre-query — it must retire too, or the session
+        # errors instantly forever.
+        session, holder = _make_session(
+            script=[AssistantMessage(content=[TextBlock("partial")])]
+        )
+        try:
+            first = session.run_turn("hi", watch_poll_interval=0.02)
+            second = session.run_turn("again", watch_poll_interval=0.02)
+        finally:
+            session.close()
+        assert first.should_retire is True
+        assert second.error is not None
+        assert "stream ended before this turn" in second.error
+        assert second.should_retire is True
+
+    def test_model_level_subtypes_still_do_not_retire(self):
+        # The retire widening is stream-death-only: error_max_turns is a
+        # model-level outcome on a HEALTHY stream and stays non-retiring.
+        session, holder = _make_session(
+            script=[
+                AssistantMessage(content=[TextBlock("partial work")]),
+                ResultMessage(subtype="error_max_turns", is_error=False),
+            ]
+        )
+        try:
+            turn = session.run_turn("hi", watch_poll_interval=0.02)
+        finally:
+            session.close()
+        assert turn.error == "SDK turn ended: error_max_turns"
+        assert turn.should_retire is False
+
+
 class TestTurnLifetimeConfig:
     def _patch_block(self, monkeypatch, block):
         import hermes_cli.config as cfg

@@ -913,6 +913,17 @@ class ClaudeAgentSdkSession:
             if hint is not None:
                 result.should_retire = True
                 result.fatal_reason = "auth"
+        if turn_data.get("stream_ended"):
+            # A dead stream is permanent on this session object: the reader
+            # exited, _stream_ended stays set, and ensure_started() keeps
+            # returning early while _client is non-None — so WITHOUT retire,
+            # every later turn short-circuits to this same error with zero
+            # model calls, forever (the CLI died once and poisoned the
+            # session; observed as the unrecoverable half of the 2026-08-09
+            # desync incident). Retire lets the runtime rebuild a fresh CLI
+            # on the next attempt/turn. Model-level result subtypes
+            # (error_max_turns, error_max_budget_usd) stay non-retiring.
+            result.should_retire = True
         if trip is not None:
             # Clean-ack trip: the CLI honored our interrupt inside the grace,
             # the partial transcript above is preserved, and the session id
@@ -969,12 +980,14 @@ class ClaudeAgentSdkSession:
             "error": None,
             "result_uuid": None,
             "model": None,
+            "stream_ended": False,
         }
         ended = self._stream_ended
         if ended is not None:
             out["error"] = "SDK message stream ended before this turn" + (
                 f": {ended.error}" if ended.error else ""
             )
+            out["stream_ended"] = True
             return out
         inbox: Any = asyncio.Queue()
         # Claim the stream BEFORE query() — a fast first message must not land
@@ -995,6 +1008,7 @@ class ClaudeAgentSdkSession:
                         "SDK message stream ended before this turn's result"
                         + (f": {message.error}" if message.error else "")
                     )
+                    out["stream_ended"] = True
                     break
                 # Capture the SDK session id from ANY message that carries it —
                 # the init SystemMessage announces it first, so even a turn
