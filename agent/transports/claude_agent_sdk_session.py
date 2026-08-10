@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Any, Callable, Optional
 
 # TurnResult is the shared contract with the runtime glue — reused verbatim
@@ -132,6 +133,167 @@ def _configured_setting_sources() -> list:
                 ", ".join(_SDK_SETTING_SOURCES),
             )
     return sources
+
+
+# ---------- turn-lifetime defaults ----------
+# The soft turn budget. It was a hard wall-clock over the whole turn since the
+# provider's birth (transplanted verbatim from the codex twin, where a
+# post-tool quiet watchdog compensates); production forensics on six 600s
+# kills showed four were actively-working turns (tool loops, human approval
+# taps) — so the budget is now evaluated together with activity evidence
+# (see _TurnWatch) instead of alone.
+_DEFAULT_TURN_TIMEOUT = 600.0
+# Post-tool quiet watchdog default WHEN streaming is on (codex parity: its
+# post_tool_quiet_timeout=90 mirrors openclaw's #81697 watchdog). With
+# streaming OFF there is no liveness signal between a tool result and the
+# next complete AssistantMessage — thinking is indistinguishable from wedged
+# — so the watchdog defaults to DISABLED there (operator opt-in).
+_DEFAULT_POST_TOOL_QUIET_STREAMING = 90.0
+# The budget rule only fires when the turn has ALSO been quiet this long
+# (capped at the budget itself so tiny test budgets keep tripping at the
+# budget): an actively-producing turn is never killed mid-sentence.
+_BUDGET_GRACE_IDLE = 30.0
+# After a watchdog trip we interrupt the CLI and give _consume_turn this long
+# to unwind on the interrupt-ack ResultMessage — a clean unwind preserves the
+# partial transcript and the resumable session id; only expiry hard-cancels.
+_TURN_ABORT_GRACE = 15.0
+# An inter-poll gap this many times the poll interval means the PROCESS was
+# stalled (swap/OOM descheduling on a Pi), not the turn — re-baseline instead
+# of tripping on time nobody was actually waiting.
+_POLL_STALL_FACTOR = 5.0
+
+
+def _configured_timeout_seconds(key: str, *, allow_zero: bool) -> Optional[float]:
+    """Numeric seconds from `agent.claude_agent_sdk.<key>`, validated.
+
+    Same warn-and-fall-back contract as _configured_max_budget_usd: bools are
+    rejected before float() (YAML `true` must not become 1.0), non-numeric and
+    negative values warn and yield None (= use the built-in default). `0` is
+    key-specific: allowed only where "disabled" is a documented meaning."""
+    raw = _provider_config().get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        logger.warning(
+            "agent.claude_agent_sdk.%s=%r is a boolean, not seconds — "
+            "ignoring it (using the built-in default).", key, raw,
+        )
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.claude_agent_sdk.%s=%r is not a number of seconds — "
+            "ignoring it (using the built-in default).", key, raw,
+        )
+        return None
+    if value < 0 or (value == 0 and not allow_zero):
+        logger.warning(
+            "agent.claude_agent_sdk.%s=%r is out of range — ignoring it "
+            "(using the built-in default).", key, raw,
+        )
+        return None
+    return value
+
+
+def _configured_turn_timeout() -> Optional[float]:
+    """agent.claude_agent_sdk.turn_timeout (seconds). Positive only — there
+    is deliberately no `0 = unlimited`: the gateway's inactivity monitor
+    (`agent.gateway_timeout`, 1800s) is the outer ceiling for SDK turns and
+    an unlimited soft budget under it would leave the quiet watchdog as the
+    only transport-level bound."""
+    return _configured_timeout_seconds("turn_timeout", allow_zero=False)
+
+
+def _configured_post_tool_quiet_timeout() -> Optional[float]:
+    """agent.claude_agent_sdk.post_tool_quiet_timeout (seconds).
+    `0` = explicitly disabled. Absent/None = streaming-dependent default
+    (90s with streaming on, disabled with streaming off)."""
+    return _configured_timeout_seconds("post_tool_quiet_timeout", allow_zero=True)
+
+
+class _TurnWatch:
+    """Activity evidence for one in-flight turn.
+
+    Single-writer threading contract: every mutating call happens on the
+    session's loop thread (message drain, projections, approval bridge); the
+    caller thread inside run_turn only READS the attributes — float/int/bool
+    attribute loads are GIL-atomic, so no lock is needed or wanted (a lock
+    shared with the loop thread would risk stalling the SDK stream drain).
+
+    Evidence gate: a turn with tool calls outstanding (issued ToolUseBlocks
+    minus resolved ToolResultBlocks — server tools never enter the count,
+    they resolve inside their own assistant message) or an approval prompt
+    awaiting a human tap is PROVABLY working/waiting and is never tripped.
+    If the CLI never resolves an issued tool id (interrupted mid-tool), the
+    suspension persists and the gateway's 1800s inactivity ceiling remains
+    the backstop — documented, deliberate."""
+
+    def __init__(self) -> None:
+        now = time.monotonic()
+        self.started = now
+        self.last_activity = now
+        self.post_tool_armed = False
+        self.outstanding_tools = 0
+        self.approvals_pending = 0
+
+    # -- loop-thread writers --
+
+    def tick(self) -> None:
+        self.last_activity = time.monotonic()
+
+    def note_tools_issued(self, count: int) -> None:
+        if count > 0:
+            self.outstanding_tools += count
+
+    def note_tools_resolved(self, count: int) -> None:
+        if count > 0:
+            self.outstanding_tools = max(0, self.outstanding_tools - count)
+
+    def arm_post_tool(self) -> None:
+        self.post_tool_armed = True
+
+    def disarm_post_tool(self) -> None:
+        self.post_tool_armed = False
+
+    def approval_begin(self) -> None:
+        self.approvals_pending += 1
+        self.tick()
+
+    def approval_end(self) -> None:
+        self.approvals_pending = max(0, self.approvals_pending - 1)
+        self.tick()
+
+    # -- caller-thread readers --
+
+    def rebaseline(self) -> None:
+        """After a detected process stall: the elapsed gap was spent
+        descheduled, not waiting — restamp so neither rule fires on it."""
+        self.last_activity = time.monotonic()
+
+    def check(self, *, budget: float, quiet: float) -> Optional[str]:
+        """Returns None (keep waiting), "post_tool_quiet", or "budget"."""
+        if self.outstanding_tools > 0 or self.approvals_pending > 0:
+            return None
+        now = time.monotonic()
+        idle = now - self.last_activity
+        if quiet > 0 and self.post_tool_armed and idle >= quiet:
+            return "post_tool_quiet"
+        elapsed = now - self.started
+        if elapsed >= budget and idle >= min(_BUDGET_GRACE_IDLE, budget):
+            return "budget"
+        return None
+
+
+def _swallow_interrupt_result(future: Any) -> None:
+    """Done-callback for the fire-and-forget client.interrupt() future: the
+    SDK's control request times out after 60s on a wedged CLI and an
+    unretrieved exception would log 'Future exception was never retrieved'
+    at teardown — retrieve and demote it."""
+    try:
+        future.result()
+    except Exception:
+        logger.debug("SDK interrupt control request failed", exc_info=True)
 
 
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
@@ -414,6 +576,13 @@ class ClaudeAgentSdkSession:
         self._session_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._closed = False
+        # Activity evidence for the in-flight turn (None between turns).
+        self._turn_watch: Optional[_TurnWatch] = None
+        # Snapshot the streaming posture once: the quiet-watchdog default is
+        # derived from it, and a mid-session config edit must not flip the
+        # watchdog's semantics while the live client still has the old
+        # include_partial_messages option.
+        self._streaming = _provider_flag("streaming")
         # Stream ownership (see _reader_loop). The reader task is the ONLY
         # consumer of the SDK stream; `_turn_inbox` is non-None exactly while a
         # turn is in flight, which is what makes "unsolicited" decidable.
@@ -516,9 +685,10 @@ class ClaudeAgentSdkSession:
         self._interrupt_event.set()
         if self._client is not None and self._loop is not None:
             try:
-                asyncio.run_coroutine_threadsafe(
+                future = asyncio.run_coroutine_threadsafe(
                     self._client.interrupt(), self._loop
                 )
+                future.add_done_callback(_swallow_interrupt_result)
             except Exception:  # pragma: no cover
                 logger.debug("SDK interrupt scheduling failed", exc_info=True)
 
@@ -528,10 +698,26 @@ class ClaudeAgentSdkSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: Optional[float] = None,
+        post_tool_quiet_timeout: Optional[float] = None,
+        watch_poll_interval: float = 1.0,
+        abort_grace: float = _TURN_ABORT_GRACE,
     ) -> TurnResult:
         """Send a user message and block until the SDK's ResultMessage,
-        projecting the typed stream into Hermes' messages shape."""
+        projecting the typed stream into Hermes' messages shape.
+
+        Turn lifetime is activity-aware, not a bare wall clock (production
+        forensics: four of six 600s kills were actively-working turns).
+        `turn_timeout` (explicit arg > agent.claude_agent_sdk.turn_timeout >
+        600s) is a SOFT budget: it only fires when nothing is outstanding —
+        no tool running, no approval awaiting a human — and the stream has
+        ALSO been quiet ≥ min(30s, budget). A post-tool quiet watchdog
+        (`post_tool_quiet_timeout`; default 90s with streaming on, disabled
+        with streaming off) catches wedges early: armed when a tool result
+        arrives, cleared by any later activity. On a trip the CLI is
+        interrupted and given `abort_grace` to unwind — a clean unwind keeps
+        the partial transcript and the resumable session id (no retire);
+        only a grace expiry hard-cancels and retires."""
         result = TurnResult()
         try:
             self.ensure_started()
@@ -573,17 +759,118 @@ class ClaudeAgentSdkSession:
             return result
         text = _coerce_turn_input_text(user_input)
 
+        import concurrent.futures
+
+        budget = (
+            float(turn_timeout)
+            if turn_timeout is not None
+            else (_configured_turn_timeout() or _DEFAULT_TURN_TIMEOUT)
+        )
+        if post_tool_quiet_timeout is not None:
+            quiet = float(post_tool_quiet_timeout)
+        else:
+            configured_quiet = _configured_post_tool_quiet_timeout()
+            if configured_quiet is not None:
+                quiet = configured_quiet  # 0 = explicitly disabled
+            else:
+                quiet = (
+                    _DEFAULT_POST_TOOL_QUIET_STREAMING if self._streaming else 0.0
+                )
+        poll = max(0.01, float(watch_poll_interval))
+
+        assert self._loop is not None, "loop thread not started"
+        watch = _TurnWatch()
+        self._turn_watch = watch
+        trip: Optional[str] = None
+        trip_elapsed = trip_idle = 0.0
+        hard_trip = False
+        turn_data: Optional[dict[str, Any]] = None
+        future = asyncio.run_coroutine_threadsafe(
+            self._consume_turn(text), self._loop
+        )
         try:
-            turn_data = self._run_coro(
-                self._consume_turn(text), timeout=turn_timeout
-            )
-        except asyncio.TimeoutError:
-            self.request_interrupt()
-            result.interrupted = True
-            result.error = f"turn timed out after {turn_timeout:.0f}s"
-            result.should_retire = True
-            return result
+            pending_verdict: Optional[str] = None
+            prev_poll = time.monotonic()
+            while turn_data is None and trip is None:
+                try:
+                    turn_data = future.result(timeout=poll)
+                except (TimeoutError, concurrent.futures.TimeoutError):
+                    # py3.11 unifies TimeoutError/asyncio.TimeoutError/
+                    # concurrent.futures.TimeoutError — a DONE future here
+                    # means the COROUTINE raised a TimeoutError-family
+                    # exception; re-raise it into the classification path
+                    # instead of misreading it as a poll expiry (which would
+                    # busy-spin this loop until the budget).
+                    if future.done():
+                        raise
+                    now = time.monotonic()
+                    if now - prev_poll > _POLL_STALL_FACTOR * poll:
+                        # The PROCESS was descheduled (swap/OOM), not the
+                        # turn — that gap proves nothing about the stream.
+                        watch.rebaseline()
+                        prev_poll = now
+                        pending_verdict = None
+                        continue
+                    prev_poll = now
+                    verdict = watch.check(budget=budget, quiet=quiet)
+                    if verdict is None:
+                        pending_verdict = None
+                        continue
+                    if pending_verdict != verdict:
+                        # Debounce: two consecutive polls must agree before
+                        # a trip (closes the tick-vs-check race window).
+                        pending_verdict = verdict
+                        continue
+                    now = time.monotonic()
+                    trip = verdict
+                    trip_elapsed = now - watch.started
+                    trip_idle = now - watch.last_activity
+            if trip is not None and turn_data is None:
+                if future.done():
+                    # Completed between check() and the trip decision —
+                    # completion wins, the trip is void.
+                    turn_data = future.result()
+                    trip = None
+                else:
+                    # Interrupt through request_interrupt(): setting
+                    # _interrupt_event is REQUIRED — _consume_turn's W22 EDE
+                    # mask keys on the turn-local flag, so the CLI's
+                    # interrupt-ack is masked instead of delivered as a
+                    # fresh error.
+                    self.request_interrupt()
+                    try:
+                        turn_data = future.result(timeout=abort_grace)
+                    except (TimeoutError, concurrent.futures.TimeoutError):
+                        if future.done():
+                            raise
+                        future.cancel()
+                        hard_trip = True
+            if trip is not None and turn_data is not None and not hard_trip:
+                if (
+                    not turn_data["error"]
+                    and turn_data.get("result_uuid")
+                    and turn_data["final_text"]
+                ):
+                    # The turn FINISHED inside the grace window with a real
+                    # answer — deliver it in full; the trip never happened.
+                    # final_text is REQUIRED: the W22-masked interrupt ack
+                    # also has error=None + a result uuid, but its final_text
+                    # is empty (projection stopped at the interrupt) — that
+                    # shape must stay a trip, or it degrades into a silent
+                    # dropped turn. Consume our own interrupt signal so the
+                    # mapping below cannot misread it. (A real user /stop
+                    # racing this exact window loses its signal too — the
+                    # completed answer it targeted is delivered, same as any
+                    # near-boundary stop today.)
+                    self._interrupt_event.clear()
+                    logger.info(
+                        "claude-agent-sdk: turn completed during watchdog "
+                        "grace (%.0fs elapsed) — delivered in full",
+                        time.monotonic() - watch.started,
+                    )
+                    trip = None
         except Exception as exc:
+            self._interrupt_event.clear()
             hint = classify_auth_failure(str(exc))
             result.error = hint or f"claude-agent-sdk turn failed: {exc}"
             result.should_retire = True
@@ -591,6 +878,20 @@ class ClaudeAgentSdkSession:
                 # Auth failures are fatal; other mid-turn exceptions stay
                 # transient (retire + retry semantics unchanged).
                 result.fatal_reason = "auth"
+            return result
+        finally:
+            self._turn_watch = None
+
+        if turn_data is None:
+            # Hard trip: the CLI ignored the interrupt for the whole grace —
+            # nothing was harvested. Retire (today's shape, now the rare
+            # fallback for a genuinely unresponsive CLI).
+            self._interrupt_event.clear()
+            result.interrupted = True
+            result.error = self._format_trip_error(
+                trip, budget, quiet, trip_elapsed, trip_idle
+            )
+            result.should_retire = True
             return result
 
         result.final_text = turn_data["final_text"]
@@ -612,7 +913,43 @@ class ClaudeAgentSdkSession:
             if hint is not None:
                 result.should_retire = True
                 result.fatal_reason = "auth"
+        if trip is not None:
+            # Clean-ack trip: the CLI honored our interrupt inside the grace,
+            # the partial transcript above is preserved, and the session id
+            # is resumable — mirror the user-interrupt lane (close-but-keep-
+            # resume-id) instead of retiring. The trip text WINS over
+            # whatever error the drain surfaced (typically the W22-masked
+            # interrupt ack) — EXCEPT auth and stream-death, which keep
+            # their retire verdicts from the mapping above.
+            if result.fatal_reason != "auth":
+                result.error = self._format_trip_error(
+                    trip, budget, quiet, trip_elapsed, trip_idle
+                )
+            result.interrupted = True
+            if not result.should_retire:
+                result.thread_id = self._session_id
         return result
+
+    def _format_trip_error(
+        self,
+        kind: Optional[str],
+        budget: float,
+        quiet: float,
+        elapsed: float,
+        idle: float,
+    ) -> str:
+        """≤200 chars (the gateway truncates at str(err)[:200]); keeps the
+        literal "turn timed out" needle; names the cause."""
+        if kind == "post_tool_quiet":
+            return (
+                f"turn timed out: no SDK activity for {idle:.0f}s after a "
+                f"tool result (turn ran {elapsed:.0f}s, quiet limit "
+                f"{quiet:.0f}s)"
+            )
+        return (
+            f"turn timed out after {elapsed:.0f}s "
+            f"(budget {budget:.0f}s, idle {idle:.0f}s)"
+        )
 
     # ---------- internals ----------
 
@@ -648,6 +985,11 @@ class ClaudeAgentSdkSession:
             await self._client.query(text)
             while True:
                 message = await inbox.get()
+                watch = self._turn_watch
+                if watch is not None:
+                    # Any stream message is liveness — stamp before anything
+                    # else so the caller-thread watchdog sees it.
+                    watch.tick()
                 if isinstance(message, _StreamEnd):
                     out["error"] = (
                         "SDK message stream ended before this turn's result"
@@ -669,12 +1011,42 @@ class ClaudeAgentSdkSession:
                     # involved. Keep draining to the result; stop projecting.
                     interrupted = True
                 if type(message).__name__ == "StreamEvent":
+                    if watch is not None:
+                        # A partial delta proves the post-tool model call is
+                        # alive — the quiet watchdog stands down.
+                        watch.disarm_post_tool()
                     if not interrupted:
                         self._forward_stream_delta(message)
                     continue
                 if not interrupted:
                     self._notify_tool_started(message)
                 projection = projector.project(message)
+                if watch is not None:
+                    # Outstanding-tool evidence: ToolUseBlocks issue, tool
+                    # results resolve (server tools never enter — the
+                    # projector resolves them inside their own assistant
+                    # message). A turn with a tool in flight is suspended
+                    # from BOTH watchdog rules.
+                    issued = sum(
+                        len(m.get("tool_calls") or [])
+                        for m in projection.messages
+                        if m.get("role") == "assistant"
+                    )
+                    if issued:
+                        watch.note_tools_issued(issued)
+                    if projection.is_tool_iteration:
+                        watch.note_tools_resolved(
+                            sum(
+                                1
+                                for m in projection.messages
+                                if m.get("role") == "tool"
+                            )
+                        )
+                        # Codex-parity arm point: a tool result just landed;
+                        # silence from here on is the wedge signature.
+                        watch.arm_post_tool()
+                    elif projection.messages or projection.final_text is not None:
+                        watch.disarm_post_tool()
                 if projection.model:
                     # Last reported id wins; captured even on interrupted
                     # turns — the tokens were still spent on that model.
@@ -1041,7 +1413,9 @@ class ClaudeAgentSdkSession:
             fields["resume"] = self._resume_session_id
         # Default OFF (upstream-conservative): partial messages only when the
         # operator opts in via agent.claude_agent_sdk.streaming in config.yaml.
-        if _provider_flag("streaming"):
+        # Reads the __init__ snapshot so option and quiet-watchdog semantics
+        # can never diverge across a mid-session config edit.
+        if self._streaming:
             fields["include_partial_messages"] = True
         return fields
 
@@ -1079,59 +1453,90 @@ class ClaudeAgentSdkSession:
                 PermissionResultDeny,
             )
 
+            # Capture the watch OBJECT at entry: an approval that outlives
+            # its turn (orphaned wait, self-expiring at approvals.timeout)
+            # must decrement the watch it suspended, never a later turn's.
+            # None = no Hermes turn in flight (unsolicited CLI-side turn) —
+            # nothing to suspend.
+            watch = self._turn_watch
+            if watch is not None:
+                # A human is being asked — their think time is not the
+                # turn's silence. Both watchdog rules stand down until the
+                # tap (or the approval machinery's own timeout) resolves.
+                watch.approval_begin()
             try:
-                kwargs: dict = {"allow_permanent": False}
-                # tool_use_id correlation (P2.a): the SDK guarantees a
-                # non-empty context.tool_use_id — thread it through so a
-                # button tap resolves THIS prompt, not queue[0]. Opt-in via
-                # marker attribute: the CLI thread-local callback keeps its
-                # exact signature (same additive philosophy as the widened
-                # return channel).
-                if getattr(approval_callback, "_accepts_tool_use_id", False):
-                    kwargs["tool_use_id"] = (
-                        getattr(context, "tool_use_id", "") or ""
-                    )
-                result = await asyncio.to_thread(
-                    approval_callback,
-                    f"{tool_name}({_tool_preview(tool_name, tool_input)})",
-                    f"Claude requests tool {tool_name}",
-                    **kwargs,
+                return await self._resolve_can_use_tool(
+                    tool_name, tool_input, context,
+                    approval_callback, hermes_session_id,
+                    PermissionResultAllow, PermissionResultDeny,
                 )
-            except Exception:
-                logger.exception("approval_callback raised on SDK permission")
-                logger.info(
-                    "claude-agent-sdk: silent deny (no operator choice): "
-                    "tool=%s reason=%s session=%s",
-                    tool_name, "approval callback failed", hermes_session_id,
-                )
-                return PermissionResultDeny(message="approval callback failed")
-            # Widened callback contract: a plain choice string, or a dict
-            # {"choice": str, "reason": str} carrying an honest deny reason
-            # (no-approver / timeout / notify-failure / teardown-expiry).
-            # "denied by user" is reserved for a real human deny — a
-            # reason-bearing deny must never be attributed to the user.
-            reason = None
-            choice = result
-            if isinstance(result, dict):
-                reason = result.get("reason")
-                choice = result.get("choice")
-            if choice in ("once", "session", "always"):
-                return PermissionResultAllow()
-            if choice == "timeout" and not reason:
-                # The CLI thread-local callback surfaces its prompt timeout
-                # as a bare string; mapping it to the user-deny default
-                # would fabricate attribution for a prompt nobody answered.
-                reason = "approval timed out — no operator response"
-            message = reason or "denied by user"
-            if not message.startswith("denied by user"):
-                logger.info(
-                    "claude-agent-sdk: silent deny (no operator choice): "
-                    "tool=%s reason=%s session=%s",
-                    tool_name, message, hermes_session_id,
-                )
-            return PermissionResultDeny(message=message)
+            finally:
+                if watch is not None:
+                    watch.approval_end()
 
         return _can_use_tool
+
+    async def _resolve_can_use_tool(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        context: Any,
+        approval_callback: Any,
+        hermes_session_id: Any,
+        PermissionResultAllow: Any,
+        PermissionResultDeny: Any,
+    ) -> Any:
+        try:
+            kwargs: dict = {"allow_permanent": False}
+            # tool_use_id correlation (P2.a): the SDK guarantees a
+            # non-empty context.tool_use_id — thread it through so a
+            # button tap resolves THIS prompt, not queue[0]. Opt-in via
+            # marker attribute: the CLI thread-local callback keeps its
+            # exact signature (same additive philosophy as the widened
+            # return channel).
+            if getattr(approval_callback, "_accepts_tool_use_id", False):
+                kwargs["tool_use_id"] = (
+                    getattr(context, "tool_use_id", "") or ""
+                )
+            result = await asyncio.to_thread(
+                approval_callback,
+                f"{tool_name}({_tool_preview(tool_name, tool_input)})",
+                f"Claude requests tool {tool_name}",
+                **kwargs,
+            )
+        except Exception:
+            logger.exception("approval_callback raised on SDK permission")
+            logger.info(
+                "claude-agent-sdk: silent deny (no operator choice): "
+                "tool=%s reason=%s session=%s",
+                tool_name, "approval callback failed", hermes_session_id,
+            )
+            return PermissionResultDeny(message="approval callback failed")
+        # Widened callback contract: a plain choice string, or a dict
+        # {"choice": str, "reason": str} carrying an honest deny reason
+        # (no-approver / timeout / notify-failure / teardown-expiry).
+        # "denied by user" is reserved for a real human deny — a
+        # reason-bearing deny must never be attributed to the user.
+        reason = None
+        choice = result
+        if isinstance(result, dict):
+            reason = result.get("reason")
+            choice = result.get("choice")
+        if choice in ("once", "session", "always"):
+            return PermissionResultAllow()
+        if choice == "timeout" and not reason:
+            # The CLI thread-local callback surfaces its prompt timeout
+            # as a bare string; mapping it to the user-deny default
+            # would fabricate attribution for a prompt nobody answered.
+            reason = "approval timed out — no operator response"
+        message = reason or "denied by user"
+        if not message.startswith("denied by user"):
+            logger.info(
+                "claude-agent-sdk: silent deny (no operator choice): "
+                "tool=%s reason=%s session=%s",
+                tool_name, message, hermes_session_id,
+            )
+        return PermissionResultDeny(message=message)
 
     # ---------- loop-thread plumbing ----------
 

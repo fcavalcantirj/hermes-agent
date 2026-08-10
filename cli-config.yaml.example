@@ -837,6 +837,21 @@ agent:
   #   # (default) = no budget. Non-numeric / non-positive values are ignored
   #   # with a warning.
   #   max_budget_usd: null
+  #   # Soft turn budget in seconds. null (default) = 600. Activity-aware:
+  #   # fires only when no tool call is outstanding, no approval prompt is
+  #   # awaiting a human, AND the SDK stream has also been quiet for
+  #   # min(30s, budget) — a turn actively running tools or producing output
+  #   # is never killed at the wall. Raise it for deployments with long
+  #   # multi-step turns; keep it under agent.gateway_timeout (1800s), the
+  #   # outer ceiling. 0/negative/non-numeric are ignored with a warning.
+  #   turn_timeout: null
+  #   # Post-tool quiet watchdog in seconds: silence budget AFTER a tool
+  #   # result before the turn is declared wedged and retired fast (codex
+  #   # parity). null (default) = 90 with streaming: true, disabled with
+  #   # streaming off (no liveness signal exists there between a tool result
+  #   # and the next complete assistant message). 0 = explicitly disabled.
+  #   # Negative/non-numeric are ignored with a warning.
+  #   post_tool_quiet_timeout: null
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving

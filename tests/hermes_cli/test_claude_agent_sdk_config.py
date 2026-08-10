@@ -39,6 +39,12 @@ class TestClaudeAgentSdkDefaults:
         assert block["setting_sources"] == []
         # null = no per-query budget cap (current behavior).
         assert block["max_budget_usd"] is None
+        # null = the built-in 600s soft budget; the value itself lives in the
+        # transport (activity-aware — see claude_agent_sdk_session.run_turn).
+        assert block["turn_timeout"] is None
+        # null = streaming-dependent built-in (90s with streaming on,
+        # disabled with streaming off); 0 = explicitly disabled.
+        assert block["post_tool_quiet_timeout"] is None
         # Every default in the block must be falsy — a new key that defaults
         # truthy is a behavior change and needs its own explicit pin here.
         for key, value in block.items():

@@ -297,6 +297,25 @@ DEFAULT_CONFIG = {
             # cron turns with nobody to answer a prompt) opt back in, e.g.
             # ["user"]. Invalid entries are dropped with a warning.
             "setting_sources": [],
+            # Soft turn budget in seconds. null (the default) = the built-in
+            # 600. The budget is activity-aware: it only fires when no tool
+            # call is outstanding, no approval prompt is awaiting a human,
+            # AND the SDK stream has also been quiet ≥ min(30s, budget) —
+            # a turn actively producing output or running tools is never
+            # killed at the wall. Raise it for deployments whose turns
+            # legitimately run long (keep it under agent.gateway_timeout,
+            # the 1800s outer ceiling). 0/negative/non-numeric values are
+            # ignored with a warning.
+            "turn_timeout": None,
+            # Post-tool quiet watchdog in seconds: how long the stream may
+            # stay silent AFTER a tool result before the turn is declared
+            # wedged (codex-parity fast-fail). null (the default) = 90 when
+            # `streaming: true` (partial deltas prove liveness), DISABLED
+            # when streaming is off (a silent post-tool model call is
+            # indistinguishable from a wedge there). 0 = explicitly
+            # disabled. Negative/non-numeric values are ignored with a
+            # warning.
+            "post_tool_quiet_timeout": None,
         },
     },
 

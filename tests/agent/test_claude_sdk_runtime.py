@@ -3690,3 +3690,472 @@ class TestBargeInInterruptHandoff:
         finally:
             session.close()
         assert turn.error is not None
+
+
+# ---------- activity-aware turn lifetime (the 600s wall-clock fix) ----------
+# Production forensics (Pi gateway, six "turn timed out after 600s" retires
+# 2026-07-22 → 2026-08-09): four of six were ACTIVELY-WORKING turns — tool
+# loops mid-execution, human approval taps counted as silence — killed by a
+# hard wall clock over the whole turn. The lifetime is now evidence-based:
+# outstanding tools and pending approvals suspend the rules; the budget only
+# fires on a turn that is ALSO quiet; a post-tool quiet watchdog catches
+# wedges early; a tripped turn that the CLI acks cleanly keeps its partial
+# transcript and resume id instead of retiring.
+
+
+class _HoldOpenClient(_FakeClient):
+    """The wedge shape: the stream stays OPEN on silence. The base fake
+    appends _EOS whenever the script has no ResultMessage (modeling a dead
+    CLI) — but a wedged turn's stream is alive and silent, which is exactly
+    the state the watchdogs exist to detect. Optionally acks interrupt()
+    with scripted messages (the CLI's interrupt-ack ResultMessage)."""
+
+    def __init__(self, *args, interrupt_ack=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._interrupt_ack = list(interrupt_ack or [])
+
+    async def query(self, text):
+        self.queried.append(text)
+        self._pending.extend(self._script)
+
+    async def interrupt(self):
+        self.interrupted = True
+        self._pending.extend(self._interrupt_ack)
+
+
+def _make_hold_open_session(script=None, interrupt_ack=None, **kwargs):
+    holder = {}
+
+    def factory(options=None):
+        holder["client"] = _HoldOpenClient(
+            options=options, script=script, interrupt_ack=interrupt_ack
+        )
+        return holder["client"]
+
+    session = ClaudeAgentSdkSession(
+        cwd="/tmp", model="claude-opus-4-8", client_factory=factory, **kwargs
+    )
+    return session, holder
+
+
+def _ede_interrupt_ack():
+    """The CLI's honored-interrupt shape (the W22 mask target)."""
+    return ResultMessage(
+        subtype="error_during_execution",
+        is_error=True,
+        result=None,
+        errors=["[ede_diagnostic] result_type=user"],
+        uuid="uuid-ede-ack",
+    )
+
+
+def _wait_for_client(holder, timeout=5.0):
+    """Feeder threads start before run_turn builds the client — block until
+    the factory has run."""
+    deadline = time.monotonic() + timeout
+    while "client" not in holder:
+        if time.monotonic() > deadline:
+            raise AssertionError("client never created")
+        time.sleep(0.01)
+    return holder["client"]
+
+
+class TestTurnLifetime:
+    def test_active_turn_survives_past_turn_timeout(self):
+        # RED on the pre-fix tree: the old hard wall clock kills this turn at
+        # 0.5s with "turn timed out after 0s" even though tool results are
+        # landing every 50ms. GREEN: activity extends the turn to completion.
+        session, holder = _make_hold_open_session(script=[])
+        stop = threading.Event()
+
+        def feeder():
+            client = _wait_for_client(holder)
+            for i in range(18):  # ~0.9s of beats at 50ms, > 0.5s budget
+                if stop.is_set():
+                    return
+                time.sleep(0.05)
+                client.feed(
+                    AssistantMessage(
+                        content=[ToolUseBlock(id=f"t{i}", name="Read", input={})]
+                    ),
+                    UserMessage(
+                        content=[ToolResultBlock(tool_use_id=f"t{i}", content="ok")]
+                    ),
+                )
+            client.feed(
+                AssistantMessage(content=[TextBlock("long job done")]),
+                ResultMessage(result="long job done", uuid="uuid-long"),
+            )
+
+        thread = threading.Thread(target=feeder, daemon=True)
+        thread.start()
+        try:
+            turn = session.run_turn(
+                "big task",
+                turn_timeout=0.5,
+                post_tool_quiet_timeout=0.0,
+                watch_poll_interval=0.02,
+            )
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            session.close()
+        assert turn.error is None
+        assert turn.should_retire is False
+        assert turn.final_text == "long job done"
+
+    def test_outstanding_tool_suspends_budget(self):
+        # A single long-running tool emits NOTHING on the stream. The issued
+        # ToolUseBlock keeps the turn suspended past the budget until its
+        # result lands. RED on the pre-fix tree (dies at 0.3s).
+        session, holder = _make_hold_open_session(
+            script=[
+                AssistantMessage(
+                    content=[ToolUseBlock(id="slow", name="Bash", input={})]
+                ),
+            ]
+        )
+
+        def feeder():
+            client = _wait_for_client(holder)
+            time.sleep(0.9)  # 3x the budget, tool still "running"
+            client.feed(
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="slow", content="done")]
+                ),
+                AssistantMessage(content=[TextBlock("tool finished")]),
+                ResultMessage(result="tool finished", uuid="uuid-slow"),
+            )
+
+        thread = threading.Thread(target=feeder, daemon=True)
+        thread.start()
+        try:
+            turn = session.run_turn(
+                "run the slow tool",
+                turn_timeout=0.3,
+                post_tool_quiet_timeout=0.0,
+                watch_poll_interval=0.02,
+            )
+        finally:
+            thread.join(timeout=5)
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "tool finished"
+
+    def test_post_tool_quiet_trips_on_wedge_clean_ack(self):
+        # Wedge signature: a tool result lands, then the stream goes silent
+        # (alive, no _EOS). The quiet watchdog trips fast, the CLI acks the
+        # interrupt with the EDE shape — and the clean ack preserves the
+        # partial transcript AND the resume id (no retire), while the trip
+        # text WINS over the masked EDE ack (never "SDK result error ...").
+        session, holder = _make_hold_open_session(
+            script=[
+                SystemMessage(session_id="sdk-wedge-1"),
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Grep", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="hits")]
+                ),
+            ],
+            interrupt_ack=[_ede_interrupt_ack()],
+        )
+        try:
+            turn = session.run_turn(
+                "search",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.2,
+                watch_poll_interval=0.05,
+            )
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "turn timed out" in turn.error
+        assert "after a tool result" in turn.error
+        assert "SDK result error" not in turn.error  # W22 mask + trip wins
+        assert turn.interrupted is True
+        assert turn.should_retire is False  # clean ack — resumable
+        # The resume id survives the trip (the ack itself carries the last
+        # session_id — any non-None id here means the next turn RESUMES).
+        assert turn.thread_id == "sdk-session-1"
+        assert holder["client"].interrupted is True
+        # Partial transcript survived the trip.
+        roles = [m["role"] for m in turn.projected_messages]
+        assert "assistant" in roles and "tool" in roles
+
+    def test_post_tool_watchdog_resets_on_activity(self):
+        # Assistant output after the tool result disarms the quiet watchdog
+        # (codex-parity reset semantics) — the turn completes untripped even
+        # though the post-text gap exceeds the quiet limit is never reached.
+        session, holder = _make_hold_open_session(script=[])
+
+        def feeder():
+            client = _wait_for_client(holder)
+            client.feed(
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Read", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="data")]
+                ),
+            )
+            time.sleep(0.15)  # < quiet (0.4): watchdog armed but not tripped
+            client.feed(AssistantMessage(content=[TextBlock("thinking done")]))
+            time.sleep(0.1)
+            client.feed(ResultMessage(result="thinking done", uuid="uuid-r"))
+
+        thread = threading.Thread(target=feeder, daemon=True)
+        thread.start()
+        try:
+            turn = session.run_turn(
+                "go",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.4,
+                watch_poll_interval=0.02,
+            )
+        finally:
+            thread.join(timeout=5)
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "thinking done"
+
+    def test_hard_trip_retires_and_clears_interrupt_event(self):
+        # The CLI ignores the interrupt for the whole grace: hard-cancel,
+        # retire (today's shape, now the rare fallback) — and the interrupt
+        # event must NOT leak into the next turn on this session object.
+        # RED on the pre-fix tree: the old timeout branch left the event set.
+        session, holder = _make_hold_open_session(script=[])  # total silence
+        try:
+            turn = session.run_turn(
+                "hello?",
+                turn_timeout=0.2,
+                post_tool_quiet_timeout=0.0,
+                watch_poll_interval=0.05,
+                abort_grace=0.2,
+            )
+            assert turn.error is not None
+            assert "turn timed out after" in turn.error
+            assert turn.should_retire is True
+            assert turn.interrupted is True
+            assert holder["client"].interrupted is True
+            assert session._interrupt_event.is_set() is False
+        finally:
+            session.close()
+
+    def test_completion_during_grace_delivered_in_full(self):
+        # The turn produced its answer text, ran a tool, then wedged; the
+        # interrupt-ack is a SUCCESS ResultMessage carrying the real answer.
+        # Completion wins: no trip error, no retire, answer delivered.
+        session, holder = _make_hold_open_session(
+            script=[
+                AssistantMessage(content=[TextBlock("the answer")]),
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Bash", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="ok")]
+                ),
+            ],
+            interrupt_ack=[
+                ResultMessage(result="the answer", uuid="uuid-late")
+            ],
+        )
+        try:
+            turn = session.run_turn(
+                "answer then wedge",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.2,
+                watch_poll_interval=0.05,
+            )
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.should_retire is False
+        assert turn.final_text == "the answer"
+
+    def test_coroutine_timeout_error_classified_not_spun(self):
+        # py3.11 unifies the TimeoutError family: a TimeoutError RAISED BY
+        # the turn coroutine (socket/pipe timeout under the CLI) must be
+        # classified as a turn failure — the pre-fix tree misread it as the
+        # turn hitting its own 600s wall ("turn timed out after 600s").
+        class TimeoutRaisingClient(_FakeClient):
+            async def query(self, text):
+                raise TimeoutError("socket write timed out")
+
+        holder = {}
+
+        def factory(options=None):
+            holder["client"] = TimeoutRaisingClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        try:
+            turn = session.run_turn("hi", watch_poll_interval=0.05)
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "claude-agent-sdk turn failed" in turn.error
+        assert "socket write timed out" in turn.error
+        assert "turn timed out after" not in turn.error
+
+    def test_pending_approval_suspends_watchdogs(self, monkeypatch):
+        # A human being asked is not the turn being silent: while the
+        # session's own can_use_tool bridge awaits the approval callback,
+        # both rules stand down — the quiet watchdog (armed by the tool
+        # result) must NOT trip during a 0.5s approval on a 0.15s quiet
+        # limit. After the tap the turn completes.
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
+        released = threading.Event()
+
+        def slow_approval(preview, prompt, **kwargs):
+            time.sleep(0.5)
+            released.set()
+            return "once"
+
+        session, holder = _make_hold_open_session(
+            script=[
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Write", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="ok")]
+                ),
+            ],
+            approval_callback=slow_approval,
+            permission_mode="default",
+        )
+
+        def feeder():
+            # The approval prompt fires on the session loop while the turn
+            # is in flight — the exact production shape (SDK invoking
+            # can_use_tool mid-turn).
+            _wait_for_client(holder)
+            time.sleep(0.1)
+            cb = session._make_can_use_tool()
+            fut = asyncio.run_coroutine_threadsafe(
+                cb("Write", {"file_path": "/x"}, SimpleNamespace(tool_use_id="t1")),
+                session._loop,
+            )
+            fut.result(timeout=5)
+            holder["client"].feed(
+                AssistantMessage(content=[TextBlock("written")]),
+                ResultMessage(result="written", uuid="uuid-appr"),
+            )
+
+        thread = threading.Thread(target=feeder, daemon=True)
+        thread.start()
+        try:
+            turn = session.run_turn(
+                "write it",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.15,
+                watch_poll_interval=0.02,
+            )
+        finally:
+            thread.join(timeout=5)
+            session.close()
+        assert released.is_set()  # the approval really took 0.5s
+        assert turn.error is None
+        assert turn.final_text == "written"
+
+
+class TestTurnLifetimeConfig:
+    def _patch_block(self, monkeypatch, block):
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": block}},
+            raising=False,
+        )
+
+    def test_turn_timeout_reader_validation(self, monkeypatch):
+        from agent.transports.claude_agent_sdk_session import (
+            _configured_turn_timeout,
+        )
+
+        self._patch_block(monkeypatch, {"turn_timeout": 1500})
+        assert _configured_turn_timeout() == 1500.0
+        self._patch_block(monkeypatch, {"turn_timeout": "900"})
+        assert _configured_turn_timeout() == 900.0
+        # 0 = unlimited does NOT exist for the budget; bools are not seconds;
+        # garbage and negatives fall back — all with a warning.
+        for bad in (0, -5, True, False, "plenty", [600]):
+            self._patch_block(monkeypatch, {"turn_timeout": bad})
+            assert _configured_turn_timeout() is None
+        self._patch_block(monkeypatch, {})
+        assert _configured_turn_timeout() is None
+
+    def test_post_tool_quiet_reader_validation(self, monkeypatch):
+        from agent.transports.claude_agent_sdk_session import (
+            _configured_post_tool_quiet_timeout,
+        )
+
+        self._patch_block(monkeypatch, {"post_tool_quiet_timeout": 120})
+        assert _configured_post_tool_quiet_timeout() == 120.0
+        # 0 = explicitly disabled IS a valid value for the quiet watchdog.
+        self._patch_block(monkeypatch, {"post_tool_quiet_timeout": 0})
+        assert _configured_post_tool_quiet_timeout() == 0.0
+        for bad in (-1, True, "off"):
+            self._patch_block(monkeypatch, {"post_tool_quiet_timeout": bad})
+            assert _configured_post_tool_quiet_timeout() is None
+
+    def test_configured_turn_timeout_reaches_the_watchdog(self, monkeypatch):
+        # End-to-end: config.yaml (not the signature default) is what the
+        # budget rule enforces. A 0.2s configured budget kills a silent turn
+        # fast even though run_turn was called with no explicit timeout.
+        self._patch_block(monkeypatch, {"turn_timeout": 0.2})
+        session, holder = _make_hold_open_session(script=[])
+        try:
+            turn = session.run_turn(
+                "hi", watch_poll_interval=0.05, abort_grace=0.2
+            )
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "turn timed out after" in turn.error
+
+    def test_turnwatch_check_semantics(self):
+        # Deterministic unit coverage of the verdict rules (no threads).
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        clock = {"now": 1000.0}
+        real_monotonic = session_mod.time.monotonic
+        session_mod.time.monotonic = lambda: clock["now"]
+        try:
+            watch = session_mod._TurnWatch()
+            # Budget: needs elapsed >= budget AND idle >= min(30, budget).
+            clock["now"] += 599.0
+            assert watch.check(budget=600.0, quiet=0.0) is None
+            clock["now"] += 2.0  # elapsed 601, idle 601
+            assert watch.check(budget=600.0, quiet=0.0) == "budget"
+            watch.tick()  # activity: idle 0 — over budget but alive
+            assert watch.check(budget=600.0, quiet=0.0) is None
+            # Outstanding tool suspends everything.
+            clock["now"] += 700.0
+            watch.note_tools_issued(1)
+            assert watch.check(budget=600.0, quiet=0.0) is None
+            watch.note_tools_resolved(1)
+            assert watch.check(budget=600.0, quiet=0.0) == "budget"
+            # Pending approval suspends everything.
+            watch.approval_begin()
+            clock["now"] += 700.0
+            assert watch.check(budget=600.0, quiet=0.0) is None
+            watch.approval_end()  # ticks: idle resets
+            assert watch.check(budget=600.0, quiet=0.0) is None
+            # Post-tool quiet: armed + idle >= quiet, before the budget.
+            watch.arm_post_tool()
+            clock["now"] += 91.0
+            assert watch.check(budget=60000.0, quiet=90.0) == "post_tool_quiet"
+            # Disabled quiet (0) never fires the post-tool rule.
+            assert watch.check(budget=60000.0, quiet=0.0) is None
+            watch.disarm_post_tool()
+            assert watch.check(budget=60000.0, quiet=90.0) is None
+            # Rebaseline absorbs a process stall.
+            watch.arm_post_tool()
+            clock["now"] += 500.0
+            watch.rebaseline()
+            assert watch.check(budget=60000.0, quiet=90.0) is None
+        finally:
+            session_mod.time.monotonic = real_monotonic
