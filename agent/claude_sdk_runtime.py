@@ -735,6 +735,12 @@ def run_claude_agent_sdk_turn(
             "api_calls": 0,
             "completed": False,
             "partial": True,
+            # Without this key the gateway's empty-response normalizer has no
+            # branch to take (interrupted absent, api_calls 0, partial True →
+            # every arm defeated) and the user's message dies in SILENCE.
+            # With it, api_calls==0 + interrupted surfaces the honest
+            # "interrupted before processing — send it again" path.
+            "interrupted": True,
             "error": None,
             "agent_persisted": True,
         }
@@ -794,8 +800,15 @@ def run_claude_agent_sdk_turn(
             # Error/timeout retire always clears the persisted resume id —
             # never resume a conversation that just failed.
             _store_sdk_session_id(agent, None)
-            if resumed and attempt == 0:
-                # Stale/failed resume: one fresh retry with digest.
+            if (
+                resumed
+                and attempt == 0
+                and not getattr(turn, "interrupted", False)
+            ):
+                # Stale/failed resume: one fresh retry with digest. Never for
+                # an INTERRUPTED retire (user /stop that killed the CLI, or a
+                # hard watchdog trip) — re-running the stopped turn in full
+                # would evaporate the stop and deliver the answer anyway.
                 resumed = False
                 continue
         break

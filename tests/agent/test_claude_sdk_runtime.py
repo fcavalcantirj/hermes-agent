@@ -1823,6 +1823,41 @@ class TestContinuity:
         assert len(instances) == 1
         assert result["partial"] is True
 
+    def test_interrupted_retire_does_not_retry(self, monkeypatch):
+        # A RESUMED session that retires on an INTERRUPTED turn (a /stop
+        # that killed the CLI, a hard watchdog trip) must NOT re-run the
+        # turn — the retry would evaporate the stop and deliver the answer
+        # anyway. Only non-interrupted resume failures earn the retry.
+        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        instances = self._spy_sessions(monkeypatch, [_make_turn(
+            should_retire=True, interrupted=True,
+            error="SDK message stream ended before this turn's result",
+            projected_messages=[], final_text="", token_usage_last=None,
+        )])
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert len(instances) == 1  # no second full-budget run
+        assert result["partial"] is True
+
+    def test_pre_turn_interrupt_short_circuit_reports_interrupted(self):
+        # The top-of-turn short-circuit consumes a pre-turn /stop without a
+        # model call. Its result dict must carry interrupted=True — without
+        # the key the gateway's empty-response normalizer has NO branch to
+        # take (api_calls 0, partial True) and the user's message dies in
+        # total silence.
+        agent, _db = self._db_agent()
+        agent._claude_sdk_session = None
+        agent._interrupt_requested = True
+        result = run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        assert result["interrupted"] is True
+        assert result["api_calls"] == 0
+        assert agent._interrupt_requested is False  # consumed
+
     def test_effective_prompt_snapshot_replaces_native_one(self, monkeypatch):
         # The prologue persists Hermes' native composed prompt — a prompt
         # this runtime never sends. The runtime overwrites the snapshot with
@@ -3676,7 +3711,12 @@ class TestBargeInInterruptHandoff:
             async def query(self, text):
                 self.queried.append(text)
                 holder["session"]._interrupt_event.set()
-                # no ResultMessage — the CLI dies; the reader sees stream end
+                # No ResultMessage — the CLI dies; the reader sees the
+                # stream END. (This _EOS is what makes the comment true:
+                # without it the fake merely went silent and the test was
+                # riding the old wall clock — 26s of suite time for the
+                # wrong mechanism.)
+                self._pending.append(_EOS)
 
         def factory(options=None):
             client = DyingClient(options=options)
@@ -3690,13 +3730,15 @@ class TestBargeInInterruptHandoff:
         finally:
             session.close()
         assert turn.error is not None
+        # Stream death retires (the poisoned-session fix), interrupt or not.
+        assert turn.should_retire is True
 
 
 # ---------- activity-aware turn lifetime (the 600s wall-clock fix) ----------
-# Production forensics (Pi gateway, six "turn timed out after 600s" retires
-# 2026-07-22 → 2026-08-09): four of six were ACTIVELY-WORKING turns — tool
-# loops mid-execution, human approval taps counted as silence — killed by a
-# hard wall clock over the whole turn. The lifetime is now evidence-based:
+# Production forensics (24/7 gateway deployment, six "turn timed out after
+# 600s" retires 2026-07-22 → 2026-08-09): four of six were ACTIVELY-WORKING
+# turns — tool loops mid-execution, human approval taps counted as silence —
+# killed by a hard wall clock over the whole turn. The lifetime is now evidence-based:
 # outstanding tools and pending approvals suspend the rules; the budget only
 # fires on a turn that is ALSO quiet; a post-tool quiet watchdog catches
 # wedges early; a tripped turn that the CLI acks cleanly keeps its partial
@@ -3874,19 +3916,22 @@ class TestTurnLifetime:
         assert "after a tool result" in turn.error
         assert "SDK result error" not in turn.error  # W22 mask + trip wins
         assert turn.interrupted is True
+        # should_retire=False is the load-bearing assertion: the runtime
+        # persists the resume id ONLY for non-retiring turns. thread_id just
+        # has to be present for it to persist (its exact value tracks the
+        # last session_id-bearing message — here the ack's own default).
         assert turn.should_retire is False  # clean ack — resumable
-        # The resume id survives the trip (the ack itself carries the last
-        # session_id — any non-None id here means the next turn RESUMES).
-        assert turn.thread_id == "sdk-session-1"
+        assert turn.thread_id
         assert holder["client"].interrupted is True
         # Partial transcript survived the trip.
         roles = [m["role"] for m in turn.projected_messages]
         assert "assistant" in roles and "tool" in roles
 
     def test_post_tool_watchdog_resets_on_activity(self):
-        # Assistant output after the tool result disarms the quiet watchdog
-        # (codex-parity reset semantics) — the turn completes untripped even
-        # though the post-text gap exceeds the quiet limit is never reached.
+        # Assistant output after the tool result DISARMS the quiet watchdog
+        # (codex-parity reset semantics). The post-disarm silence here (0.7s)
+        # EXCEEDS the quiet limit (0.25s) — with the disarm neutered this
+        # turn trips; with it, the turn completes untouched.
         session, holder = _make_hold_open_session(script=[])
 
         def feeder():
@@ -3899,9 +3944,9 @@ class TestTurnLifetime:
                     content=[ToolResultBlock(tool_use_id="t1", content="data")]
                 ),
             )
-            time.sleep(0.15)  # < quiet (0.4): watchdog armed but not tripped
+            time.sleep(0.1)  # armed, under the limit
             client.feed(AssistantMessage(content=[TextBlock("thinking done")]))
-            time.sleep(0.1)
+            time.sleep(0.7)  # SILENCE past the limit — trips iff still armed
             client.feed(ResultMessage(result="thinking done", uuid="uuid-r"))
 
         thread = threading.Thread(target=feeder, daemon=True)
@@ -3910,7 +3955,7 @@ class TestTurnLifetime:
             turn = session.run_turn(
                 "go",
                 turn_timeout=30.0,
-                post_tool_quiet_timeout=0.4,
+                post_tool_quiet_timeout=0.25,
                 watch_poll_interval=0.02,
             )
         finally:
@@ -3918,6 +3963,56 @@ class TestTurnLifetime:
             session.close()
         assert turn.error is None
         assert turn.final_text == "thinking done"
+        # The load-bearing pin: a DISARMED watchdog never fires an interrupt
+        # at all. (Without this, a broken disarm can hide behind the
+        # completion-during-grace rescue, which still delivers the pre-trip
+        # text — resilient, but the needless interrupt+reconnect cycle is
+        # exactly what the disarm exists to avoid.)
+        assert holder["client"].interrupted is False
+
+    def test_stream_deltas_disarm_quiet_watchdog(self):
+        # Streaming posture — the only posture where the quiet watchdog
+        # defaults ON: partial deltas after a tool result prove the model
+        # call is alive and DISARM the watchdog. The post-delta silence
+        # (0.7s) exceeds the quiet limit (0.25s) — trips iff the StreamEvent
+        # branch's disarm is broken.
+        session, holder = _make_hold_open_session(script=[])
+        session._streaming = True  # the __init__ snapshot, forced for the test
+
+        def feeder():
+            client = _wait_for_client(holder)
+            client.feed(
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Bash", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="ok")]
+                ),
+            )
+            for _ in range(3):
+                time.sleep(0.05)
+                client.feed(_text_delta_event("chunk "))
+            time.sleep(0.7)  # silence past the limit — armed would trip
+            client.feed(
+                AssistantMessage(content=[TextBlock("streamed answer")]),
+                ResultMessage(result="streamed answer", uuid="uuid-sd"),
+            )
+
+        thread = threading.Thread(target=feeder, daemon=True)
+        thread.start()
+        try:
+            turn = session.run_turn(
+                "stream it",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.25,
+                watch_poll_interval=0.02,
+            )
+        finally:
+            thread.join(timeout=5)
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "streamed answer"
+        assert holder["client"].interrupted is False  # watchdog never fired
 
     def test_hard_trip_retires_and_clears_interrupt_event(self):
         # The CLI ignores the interrupt for the whole grace: hard-cancel,
@@ -3943,9 +4038,11 @@ class TestTurnLifetime:
             session.close()
 
     def test_completion_during_grace_delivered_in_full(self):
-        # The turn produced its answer text, ran a tool, then wedged; the
-        # interrupt-ack is a SUCCESS ResultMessage carrying the real answer.
-        # Completion wins: no trip error, no retire, answer delivered.
+        # The answer text streamed BEFORE the trip; the success ack's uuid
+        # then completes the turn inside the grace. Completion wins: no trip
+        # error, no retire, the PRE-TRIP text is delivered. (The ack's own
+        # result= text is never projected — projection stops at the
+        # interrupt — so final_text here is the earlier AssistantMessage's.)
         session, holder = _make_hold_open_session(
             script=[
                 AssistantMessage(content=[TextBlock("the answer")]),
@@ -3957,7 +4054,7 @@ class TestTurnLifetime:
                 ),
             ],
             interrupt_ack=[
-                ResultMessage(result="the answer", uuid="uuid-late")
+                ResultMessage(result=None, uuid="uuid-late")
             ],
         )
         try:
@@ -3972,6 +4069,38 @@ class TestTurnLifetime:
         assert turn.error is None
         assert turn.should_retire is False
         assert turn.final_text == "the answer"
+
+    def test_success_ack_without_prior_text_stays_a_trip(self):
+        # Negative control for the completion lane's final_text gate: a
+        # SUCCESS ack with a uuid but NO answer text anywhere (pure
+        # tool-work turn) must remain a trip — voiding it here would turn
+        # the timeout into a silent empty delivery.
+        session, holder = _make_hold_open_session(
+            script=[
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Bash", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="ok")]
+                ),
+            ],
+            interrupt_ack=[
+                ResultMessage(result=None, uuid="uuid-empty")
+            ],
+        )
+        try:
+            turn = session.run_turn(
+                "tool work then wedge",
+                turn_timeout=30.0,
+                post_tool_quiet_timeout=0.2,
+                watch_poll_interval=0.05,
+            )
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "turn timed out" in turn.error
+        assert turn.interrupted is True
+        assert turn.should_retire is False  # clean ack still preserves resume
 
     def test_coroutine_timeout_error_classified_not_spun(self):
         # py3.11 unifies the TimeoutError family: a TimeoutError RAISED BY
@@ -4028,9 +4157,19 @@ class TestTurnLifetime:
         def feeder():
             # The approval prompt fires on the session loop while the turn
             # is in flight — the exact production shape (SDK invoking
-            # can_use_tool mid-turn).
+            # can_use_tool mid-turn). Event-based sync: wait until the tool
+            # result actually ARMED the watchdog, then fire the approval
+            # immediately (a sleep here left a ~36ms margin against the
+            # quiet limit — flake fuel on loaded CI).
             _wait_for_client(holder)
-            time.sleep(0.1)
+            deadline = time.monotonic() + 5
+            while True:
+                watch = session._turn_watch
+                if watch is not None and watch.post_tool_armed:
+                    break
+                if time.monotonic() > deadline:
+                    raise AssertionError("watchdog never armed")
+                time.sleep(0.01)
             cb = session._make_can_use_tool()
             fut = asyncio.run_coroutine_threadsafe(
                 cb("Write", {"file_path": "/x"}, SimpleNamespace(tool_use_id="t1")),
@@ -4057,6 +4196,50 @@ class TestTurnLifetime:
         assert released.is_set()  # the approval really took 0.5s
         assert turn.error is None
         assert turn.final_text == "written"
+
+    def test_orphaned_approval_decrements_its_own_watch(self, monkeypatch):
+        # The F9 shape: an approval wait that OUTLIVES its turn must
+        # decrement the watch it suspended — never a later turn's. The
+        # callback captures the watch object at entry; a stale decrement
+        # lands on the dead watch.
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        release = threading.Event()
+
+        def blocking_cb(preview, prompt, **kwargs):
+            release.wait(5)
+            return "once"
+
+        session, holder = _make_hold_open_session(
+            script=[], approval_callback=blocking_cb,
+            permission_mode="default",
+        )
+        try:
+            session.ensure_started()
+            w1 = session_mod._TurnWatch()
+            session._turn_watch = w1
+            cb = session._make_can_use_tool()
+            fut = asyncio.run_coroutine_threadsafe(
+                cb("Bash", {}, SimpleNamespace(tool_use_id="t1")),
+                session._loop,
+            )
+            deadline = time.monotonic() + 5
+            while w1.approvals_pending != 1:
+                if time.monotonic() > deadline:
+                    raise AssertionError("approval never registered on w1")
+                time.sleep(0.01)
+            # Turn 1 ends; turn 2 installs a fresh watch while the approval
+            # is still pending.
+            w2 = session_mod._TurnWatch()
+            session._turn_watch = w2
+            release.set()
+            fut.result(timeout=5)
+            assert w1.approvals_pending == 0  # its OWN watch decremented
+            assert w2.approvals_pending == 0  # the new turn's never touched
+        finally:
+            release.set()
+            session.close()
 
 
 class TestDeadStreamRetires:
@@ -4171,46 +4354,71 @@ class TestTurnLifetimeConfig:
         assert turn.error is not None
         assert "turn timed out after" in turn.error
 
-    def test_turnwatch_check_semantics(self):
+    def test_configured_quiet_reaches_the_watchdog(self, monkeypatch):
+        # End-to-end for the second knob: with streaming OFF the quiet
+        # watchdog defaults to disabled — a configured value must still
+        # reach and arm it.
+        self._patch_block(monkeypatch, {"post_tool_quiet_timeout": 0.2})
+        session, holder = _make_hold_open_session(
+            script=[
+                AssistantMessage(
+                    content=[ToolUseBlock(id="t1", name="Grep", input={})]
+                ),
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="t1", content="x")]
+                ),
+            ],
+            interrupt_ack=[_ede_interrupt_ack()],
+        )
+        try:
+            turn = session.run_turn(
+                "hi", turn_timeout=30.0, watch_poll_interval=0.05
+            )
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "after a tool result" in turn.error
+
+    def test_turnwatch_check_semantics(self, monkeypatch):
         # Deterministic unit coverage of the verdict rules (no threads).
+        # Module-LOCAL time shadow — patching stdlib time.monotonic
+        # process-wide would freeze asyncio loop clocks in concurrent tests.
         from agent.transports import claude_agent_sdk_session as session_mod
 
         clock = {"now": 1000.0}
-        real_monotonic = session_mod.time.monotonic
-        session_mod.time.monotonic = lambda: clock["now"]
-        try:
-            watch = session_mod._TurnWatch()
-            # Budget: needs elapsed >= budget AND idle >= min(30, budget).
-            clock["now"] += 599.0
-            assert watch.check(budget=600.0, quiet=0.0) is None
-            clock["now"] += 2.0  # elapsed 601, idle 601
-            assert watch.check(budget=600.0, quiet=0.0) == "budget"
-            watch.tick()  # activity: idle 0 — over budget but alive
-            assert watch.check(budget=600.0, quiet=0.0) is None
-            # Outstanding tool suspends everything.
-            clock["now"] += 700.0
-            watch.note_tools_issued(1)
-            assert watch.check(budget=600.0, quiet=0.0) is None
-            watch.note_tools_resolved(1)
-            assert watch.check(budget=600.0, quiet=0.0) == "budget"
-            # Pending approval suspends everything.
-            watch.approval_begin()
-            clock["now"] += 700.0
-            assert watch.check(budget=600.0, quiet=0.0) is None
-            watch.approval_end()  # ticks: idle resets
-            assert watch.check(budget=600.0, quiet=0.0) is None
-            # Post-tool quiet: armed + idle >= quiet, before the budget.
-            watch.arm_post_tool()
-            clock["now"] += 91.0
-            assert watch.check(budget=60000.0, quiet=90.0) == "post_tool_quiet"
-            # Disabled quiet (0) never fires the post-tool rule.
-            assert watch.check(budget=60000.0, quiet=0.0) is None
-            watch.disarm_post_tool()
-            assert watch.check(budget=60000.0, quiet=90.0) is None
-            # Rebaseline absorbs a process stall.
-            watch.arm_post_tool()
-            clock["now"] += 500.0
-            watch.rebaseline()
-            assert watch.check(budget=60000.0, quiet=90.0) is None
-        finally:
-            session_mod.time.monotonic = real_monotonic
+        monkeypatch.setattr(
+            session_mod, "time", SimpleNamespace(monotonic=lambda: clock["now"])
+        )
+        watch = session_mod._TurnWatch()
+        # Budget: needs elapsed >= budget AND idle >= min(30, budget).
+        clock["now"] += 599.0
+        assert watch.check(budget=600.0, quiet=0.0) is None
+        clock["now"] += 2.0  # elapsed 601, idle 601
+        assert watch.check(budget=600.0, quiet=0.0) == "budget"
+        watch.tick()  # activity: idle 0 — over budget but alive
+        assert watch.check(budget=600.0, quiet=0.0) is None
+        # Outstanding tool suspends everything.
+        clock["now"] += 700.0
+        watch.note_tools_issued(1)
+        assert watch.check(budget=600.0, quiet=0.0) is None
+        watch.note_tools_resolved(1)
+        assert watch.check(budget=600.0, quiet=0.0) == "budget"
+        # Pending approval suspends everything.
+        watch.approval_begin()
+        clock["now"] += 700.0
+        assert watch.check(budget=600.0, quiet=0.0) is None
+        watch.approval_end()  # ticks: idle resets
+        assert watch.check(budget=600.0, quiet=0.0) is None
+        # Post-tool quiet: armed + idle >= quiet, before the budget.
+        watch.arm_post_tool()
+        clock["now"] += 91.0
+        assert watch.check(budget=60000.0, quiet=90.0) == "post_tool_quiet"
+        # Disabled quiet (0) never fires the post-tool rule.
+        assert watch.check(budget=60000.0, quiet=0.0) is None
+        watch.disarm_post_tool()
+        assert watch.check(budget=60000.0, quiet=90.0) is None
+        # Rebaseline absorbs a process stall.
+        watch.arm_post_tool()
+        clock["now"] += 500.0
+        watch.rebaseline()
+        assert watch.check(budget=60000.0, quiet=90.0) is None

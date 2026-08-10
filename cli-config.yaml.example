@@ -846,8 +846,9 @@ agent:
   #   # outer ceiling. 0/negative/non-numeric are ignored with a warning.
   #   turn_timeout: null
   #   # Post-tool quiet watchdog in seconds: silence budget AFTER a tool
-  #   # result before the turn is declared wedged and retired fast (codex
-  #   # parity). null (default) = 90 with streaming: true, disabled with
+  #   # result before the turn is declared wedged and interrupted fast (a
+  #   # clean interrupt-ack keeps the resume id; only an unresponsive CLI
+  #   # retires). null (default) = 90 with streaming: true, disabled with
   #   # streaming off (no liveness signal exists there between a tool result
   #   # and the next complete assistant message). 0 = explicitly disabled.
   #   # Negative/non-numeric are ignored with a warning.

@@ -158,8 +158,8 @@ _BUDGET_GRACE_IDLE = 30.0
 # partial transcript and the resumable session id; only expiry hard-cancels.
 _TURN_ABORT_GRACE = 15.0
 # An inter-poll gap this many times the poll interval means the PROCESS was
-# stalled (swap/OOM descheduling on a Pi), not the turn — re-baseline instead
-# of tripping on time nobody was actually waiting.
+# stalled (swap/OOM descheduling on a memory-constrained host), not the turn
+# — re-baseline instead of tripping on time nobody was actually waiting.
 _POLL_STALL_FACTOR = 5.0
 
 
@@ -215,11 +215,16 @@ def _configured_post_tool_quiet_timeout() -> Optional[float]:
 class _TurnWatch:
     """Activity evidence for one in-flight turn.
 
-    Single-writer threading contract: every mutating call happens on the
-    session's loop thread (message drain, projections, approval bridge); the
-    caller thread inside run_turn only READS the attributes — float/int/bool
-    attribute loads are GIL-atomic, so no lock is needed or wanted (a lock
-    shared with the loop thread would risk stalling the SDK stream drain).
+    Threading contract: mutating calls happen on the session's loop thread
+    (message drain, projections, approval bridge) with ONE sanctioned
+    exception — rebaseline(), called from the run_turn poll thread, also
+    writes last_activity. That dual-writer race is benign by construction:
+    float stores are GIL-atomic (never torn), and a lost update leaves
+    last_activity merely STALE, which the stall detector re-baselines and
+    the two-poll debounce absorbs before any verdict — trips can only be
+    DELAYED by it, never wrongly fired. Everything else is single-writer;
+    the poll thread otherwise only READS. No lock, deliberately: a lock
+    shared with the loop thread would risk stalling the SDK stream drain.
 
     Evidence gate: a turn with tool calls outstanding (issued ToolUseBlocks
     minus resolved ToolResultBlocks — server tools never enter the count,
@@ -797,12 +802,17 @@ class ClaudeAgentSdkSession:
                 except (TimeoutError, concurrent.futures.TimeoutError):
                     # py3.11 unifies TimeoutError/asyncio.TimeoutError/
                     # concurrent.futures.TimeoutError — a DONE future here
-                    # means the COROUTINE raised a TimeoutError-family
-                    # exception; re-raise it into the classification path
-                    # instead of misreading it as a poll expiry (which would
-                    # busy-spin this loop until the budget).
+                    # means the COROUTINE settled in the race window: with an
+                    # exception (typically its own TimeoutError — a socket/
+                    # pipe timeout under the CLI), re-raise into the
+                    # classification path instead of misreading it as a poll
+                    # expiry (which would busy-spin until the budget); with a
+                    # RESULT, harvest it — the turn completed.
                     if future.done():
-                        raise
+                        if future.exception() is not None:
+                            raise
+                        turn_data = future.result()
+                        continue
                     now = time.monotonic()
                     if now - prev_poll > _POLL_STALL_FACTOR * poll:
                         # The PROCESS was descheduled (swap/OOM), not the
@@ -842,9 +852,17 @@ class ClaudeAgentSdkSession:
                         turn_data = future.result(timeout=abort_grace)
                     except (TimeoutError, concurrent.futures.TimeoutError):
                         if future.done():
-                            raise
-                        future.cancel()
-                        hard_trip = True
+                            if future.exception() is not None:
+                                raise
+                            turn_data = future.result()
+                        elif not future.cancel():
+                            # Settled in the cancel race window — a real
+                            # result beats a fabricated hard trip.
+                            if future.exception() is not None:
+                                raise
+                            turn_data = future.result()
+                        else:
+                            hard_trip = True
             if trip is not None and turn_data is not None and not hard_trip:
                 if (
                     not turn_data["error"]
@@ -937,8 +955,6 @@ class ClaudeAgentSdkSession:
                     trip, budget, quiet, trip_elapsed, trip_idle
                 )
             result.interrupted = True
-            if not result.should_retire:
-                result.thread_id = self._session_id
         return result
 
     def _format_trip_error(
