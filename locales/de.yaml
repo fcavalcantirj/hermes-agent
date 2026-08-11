@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Dieser Befehl steht auf der unbedingten Sperrliste und kann nicht genehmigt werden."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Ich bin da — schreib mir jederzeit. /help zeigt, was ich kann."
+  knock:
+    hold: "Einen Moment bitte — ich habe meinen Besitzer informiert. 🙏"
+    prompt_plain: "🚪 Neuer Nutzer auf {platform}: {user_name} ({user_id})\n\n„{message}“\n\n(Diese Plattform hat keine Freigabe-Buttons — Zugriff über die Allowlist gewähren.)"
+    approved_user: "✅ Freigegeben! Ich beantworte jetzt deine Nachricht."
+    stamp_approved: "✅ Freigegeben von {approver}"
+    stamp_denied: "❌ Abgelehnt von {approver}"
+    not_allowed: "⛔ Nur konfigurierte Freigeber können dies entscheiden."
   approval_expired: "⚠️ Genehmigung abgelaufen (Agent wartet nicht mehr). Bitten Sie den Agenten, es erneut zu versuchen."
   draining:         "⏳ Warte auf {count} aktive(n) Agent(en) vor dem Neustart..."
   goal_cleared:     "✓ Ziel gelöscht."

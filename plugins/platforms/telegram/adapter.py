@@ -959,7 +959,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not self._telegram_auth_env_configured():
                 return True
             try:
-                return bool(auth_fn(source))
+                if bool(auth_fn(source)):
+                    return True
+                # Unauthorized — but a knock-enabled DM must still reach the
+                # gateway cold path, where the knock flow holds it for owner
+                # approval (it never reaches the agent).
+                return self._knock_dm_passthrough(source)
             except Exception:
                 logger.debug(
                     "[Telegram] Falling back to env-only auth for user %s",
@@ -971,7 +976,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed_csv:
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or user_id in allowed_ids
+        if "*" in allowed_ids or user_id in allowed_ids:
+            return True
+        return self._knock_dm_passthrough(source)
+
+    @staticmethod
+    def _knock_dm_passthrough(source) -> bool:
+        """True when an unauthorized DM should pass the intake prefilter so
+        the gateway's knock flow (owner approve/deny) can handle it."""
+        if getattr(source, "chat_type", None) != "dm":
+            return False
+        return bool(os.getenv("TELEGRAM_PAIRING_APPROVERS", "").strip())
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -5619,6 +5634,154 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def send_knock_prompt(self, chat_id, *, user_id, user_name, message):
+        """Send an approve/deny prompt for a knock (new-user) request.
+
+        Returns ``(chat_id, message_id)`` so the gateway can record the prompt
+        and edit every approver's copy once one of them resolves it. None on
+        failure (the gateway degrades to a plain-text notification).
+        """
+        try:
+            display = _html.escape(user_name or str(user_id))
+            preview = _html.escape((message or "")[:1500])
+            text = (
+                f"🚪 <b>New user wants to talk</b>\n\n"
+                f"<b>{display}</b> (<code>{_html.escape(str(user_id))}</code>)\n\n"
+                f"<pre>{preview}</pre>"
+            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"pk:a:{user_id}"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"pk:d:{user_id}"),
+            ]])
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+            return (str(chat_id), getattr(msg, "message_id", None))
+        except Exception:
+            logger.warning(
+                "[Telegram] Failed to send knock prompt to %s", chat_id, exc_info=True
+            )
+            return None
+
+    @staticmethod
+    def _knock_approver_ids() -> set:
+        return {
+            u.strip()
+            for u in os.getenv("TELEGRAM_PAIRING_APPROVERS", "").split(",")
+            if u.strip()
+        }
+
+    async def _handle_knock_callback(self, query, data: str) -> None:
+        """Resolve a knock approve/deny button press (pk:a|d:user_id).
+
+        The callback data carries the requester's user id directly, so a
+        pending knock survives gateway restarts (no in-memory state). Only
+        ids listed in TELEGRAM_PAIRING_APPROVERS may press — fail-closed.
+        """
+        from agent.i18n import t
+
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in ("a", "d") or not parts[2]:
+            await query.answer(text="Invalid knock data.")
+            return
+        action, target_user_id = parts[1], parts[2]
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if caller_id not in self._knock_approver_ids():
+            await query.answer(text=t("gateway.knock.not_allowed"))
+            return
+
+        from gateway.pairing import PairingStore
+
+        store = PairingStore()
+        approver_name = getattr(query.from_user, "first_name", None) or caller_id
+        if action == "a":
+            record = store.approve_knock(
+                "telegram", target_user_id, approved_by=caller_id
+            )
+            stamp = t("gateway.knock.stamp_approved", approver=approver_name)
+        else:
+            record = store.deny_knock(
+                "telegram", target_user_id, denied_by=caller_id
+            )
+            stamp = t("gateway.knock.stamp_denied", approver=approver_name)
+
+        if record is None:
+            await query.answer(text="This request has already been resolved.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        await query.answer(text=stamp)
+        display = record.get("user_name") or target_user_id
+        resolved_text = f"🚪 {display} ({target_user_id})\n\n{stamp}"
+
+        # Edit every approver's prompt copy so nobody acts on a stale prompt.
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        edited_own = False
+        for ref in record.get("prompts") or []:
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=normalize_telegram_chat_id(ref.get("chat_id")),
+                    message_id=ref.get("message_id"),
+                    text=resolved_text,
+                    reply_markup=None,
+                )
+                if ref.get("message_id") == query_message_id:
+                    edited_own = True
+            except Exception:
+                logger.debug("[Telegram] knock prompt edit failed", exc_info=True)
+        if not edited_own:
+            try:
+                await query.edit_message_text(text=resolved_text, reply_markup=None)
+            except Exception:
+                pass
+
+        if action == "a":
+            requester_chat_id = record.get("chat_id")
+            if requester_chat_id:
+                try:
+                    await self.send(requester_chat_id, t("gateway.knock.approved_user"))
+                except Exception:
+                    logger.warning(
+                        "[Telegram] knock: failed to notify approved user %s",
+                        target_user_id,
+                        exc_info=True,
+                    )
+                held = (record.get("message") or "").strip()
+                if held:
+                    await self._replay_knock_message(target_user_id, record, held)
+
+    async def _replay_knock_message(self, user_id: str, record: dict, held: str) -> None:
+        """Re-inject the held first message through the normal pipeline so the
+        agent answers it now that the user is authorized."""
+        from gateway.session import SessionSource
+
+        try:
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=str(record.get("chat_id") or user_id),
+                chat_type="dm",
+                user_id=str(user_id),
+                user_name=record.get("user_name") or None,
+            )
+            event = MessageEvent(
+                text=held, message_type=MessageType.TEXT, source=source
+            )
+            await self.handle_message(event)
+        except Exception:
+            logger.warning(
+                "[Telegram] knock: failed to replay held message for %s",
+                user_id,
+                exc_info=True,
+            )
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -5722,6 +5885,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # button click.
                 if count and query_chat_id is not None:
                     self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Knock callbacks (pk:a|d:user_id) — new-user approve/deny ---
+        if data.startswith("pk:"):
+            await self._handle_knock_callback(query, data)
             return
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---

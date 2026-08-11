@@ -30,6 +30,16 @@ approval:
   blocklist_message: "This command is on the unconditional blocklist and cannot be approved."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 I'm here — send me a message anytime. /help shows what I can do."
+  knock:
+    hold: "One moment, please — I've asked my owner to let you in. 🙏"
+    prompt_plain: "🚪 New user on {platform}: {user_name} ({user_id})\n\n“{message}”\n\n(This platform has no approve buttons — grant access by adding the user to the allowlist.)"
+    approved_user: "✅ You're in! I'm answering your message now."
+    stamp_approved: "✅ Approved by {approver}"
+    stamp_denied: "❌ Denied by {approver}"
+    not_allowed: "⛔ Only configured approvers can resolve this."
   # Messenger replies to slash commands and implicit state changes.
   approval_expired: "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
   draining:         "⏳ Draining {count} active agent(s) before restart..."

@@ -645,6 +645,14 @@ class GatewayAuthorizationMixin:
         if platform == Platform.EMAIL:
             return "ignore"
 
+        # Knock: when the operator names approvers for this platform
+        # (``<PLATFORM>_PAIRING_APPROVERS``), unknown DMs are held for an
+        # explicit in-platform approve/deny instead of being dropped by the
+        # allowlist default below. Configuring approvers IS the opt-in, so it
+        # wins over the allowlist-forced "ignore".
+        if platform and self._knock_approvers(platform):
+            return "knock"
+
         # Check for an explicit global config override.
         if config and hasattr(config, "unauthorized_dm_behavior"):
             if config.unauthorized_dm_behavior != "pair":  # non-default → explicit override
@@ -708,3 +716,15 @@ class GatewayAuthorizationMixin:
             return "ignore"
 
         return "pair"
+
+    def _knock_approvers(self, platform: Optional[Platform]) -> list:
+        """User ids allowed to approve/deny knock requests for a platform.
+
+        Read from ``<PLATFORM>_PAIRING_APPROVERS`` (CSV) on every call so a
+        config change needs no gateway restart. Empty list = knock disabled.
+        """
+        if platform is None:
+            return []
+        env_key = f"{platform.value.upper()}_PAIRING_APPROVERS"
+        raw = os.getenv(env_key, "")
+        return [uid.strip() for uid in raw.split(",") if uid.strip()]

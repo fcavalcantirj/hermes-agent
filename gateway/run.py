@@ -9001,6 +9001,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _handle_knock_request(self, event: MessageEvent, source: SessionSource) -> None:
+        """Hold an unknown DM user for owner approval (knock flow).
+
+        The requester gets one localized hold message, every configured
+        approver gets an approve/deny prompt, and the first message is stored
+        so the agent can answer it once the user is approved. Denied users and
+        users with a knock already pending stay silent.
+        """
+        platform_name = source.platform.value if source.platform else "unknown"
+        store = (
+            self._pairing_store_for(source)
+            if hasattr(self, "_pairing_store_for")
+            else self.pairing_store
+        )
+        if store.is_knock_denied(platform_name, source.user_id):
+            return
+        if store.knock_pending(platform_name, source.user_id) is not None:
+            return
+        if store._is_rate_limited(platform_name, source.user_id):
+            return
+        created = store.create_knock(
+            platform_name,
+            source.user_id,
+            source.user_name or "",
+            source.chat_id,
+            event.text or "",
+        )
+        if not created:
+            return
+        # Damp repeat knock attempts from the same user (the pending record
+        # already silences them; the rate limit covers create/deny races).
+        store._record_rate_limit(platform_name, source.user_id)
+
+        adapter = self._adapter_for_source(source)
+        if not adapter:
+            return
+        hold_message = os.getenv("HERMES_KNOCK_HOLD_MESSAGE", "").strip() or t(
+            "gateway.knock.hold"
+        )
+        try:
+            await adapter.send(source.chat_id, hold_message)
+        except Exception:
+            logger.warning("knock: failed to send hold message to %s", source.user_id, exc_info=True)
+
+        prompt_sender = getattr(adapter, "send_knock_prompt", None)
+        for approver in self._knock_approvers(source.platform):
+            try:
+                if prompt_sender:
+                    ref = await prompt_sender(
+                        approver,
+                        user_id=str(source.user_id),
+                        user_name=source.user_name or "",
+                        message=event.text or "",
+                    )
+                    if ref:
+                        store.add_knock_prompt(
+                            platform_name, source.user_id, str(ref[0]), ref[1]
+                        )
+                else:
+                    await adapter.send(
+                        approver,
+                        t(
+                            "gateway.knock.prompt_plain",
+                            user_name=source.user_name or str(source.user_id),
+                            user_id=str(source.user_id),
+                            message=(event.text or "")[:1000],
+                            platform=platform_name,
+                        ),
+                    )
+            except Exception:
+                logger.warning(
+                    "knock: failed to notify approver %s on %s",
+                    approver,
+                    platform_name,
+                    exc_info=True,
+                )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9108,15 +9185,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if (
-                source.chat_type == "dm"
-                and self._get_unauthorized_dm_behavior(
-                    source.platform,
-                    profile=source.profile,
-                )
-                == "pair"
-            ):
+            # In DMs: offer pairing code, or hold for owner approval (knock).
+            # In groups: silently ignore.
+            _dm_behavior = (
+                self._get_unauthorized_dm_behavior(source.platform, profile=source.profile)
+                if source.chat_type == "dm"
+                else "ignore"
+            )
+            if _dm_behavior == "knock":
+                await self._handle_knock_request(event, source)
+                return None
+            if _dm_behavior == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
@@ -9405,12 +9484,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
 
-            # Telegram sends /start for bot launches/deep-links. Treat it as a
-            # platform ping, not a user command: no help dump, no agent
-            # interrupt, no queued text.
+            # Telegram sends /start for bot launches/deep-links. Never dump
+            # /help, never interrupt the agent, never queue text — but answer
+            # with a short greeting instead of dead silence (an authorized
+            # user pressing Start deserves a sign of life).
             if _cmd_def_inner and _cmd_def_inner.name == "start":
-                logger.info("Ignoring /start platform ping for active session %s", _quick_key)
-                return ""
+                logger.info("Greeting /start during active session %s", _quick_key)
+                return t("gateway.start.greeting")
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
@@ -9894,8 +9974,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_help_command(event)
 
         if canonical == "start":
-            logger.info("Ignoring /start platform ping for session %s", _quick_key)
-            return ""
+            # No help dump, no queued text — but greet instead of silence.
+            logger.info("Greeting /start for session %s", _quick_key)
+            return t("gateway.start.greeting")
 
         if canonical == "commands":
             return await self._handle_commands_command(event)

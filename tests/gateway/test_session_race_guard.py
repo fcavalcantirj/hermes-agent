@@ -335,8 +335,9 @@ async def test_command_messages_do_not_leave_sentinel():
 
 
 @pytest.mark.asyncio
-async def test_start_command_is_noop_and_does_not_show_help():
-    """Telegram /start is a platform ping; it must not dump /help output."""
+async def test_start_command_greets_and_does_not_show_help():
+    """Telegram /start greets the (authorized) user; it must not dump /help
+    output, queue text, or start an agent."""
     runner = _make_runner()
     event = _make_event(text="/start")
     session_key = build_session_key(event.source)
@@ -345,14 +346,15 @@ async def test_start_command_is_noop_and_does_not_show_help():
 
     result = await runner._handle_message(event)
 
-    assert result == ""
+    assert isinstance(result, str) and result.strip()
     runner._handle_help_command.assert_not_awaited()
     assert session_key not in runner._running_agents
 
 
 @pytest.mark.asyncio
-async def test_start_command_is_noop_during_active_session():
-    """A mid-run /start must not interrupt the active agent or show commands."""
+async def test_start_command_greets_without_interrupting_active_session():
+    """A mid-run /start must not interrupt the active agent or show commands;
+    it still answers with the greeting instead of dead silence."""
     runner = _make_runner()
     event = _make_event(text="/start")
     session_key = build_session_key(event.source)
@@ -364,7 +366,7 @@ async def test_start_command_is_noop_during_active_session():
 
     result = await runner._handle_message(event)
 
-    assert result == ""
+    assert isinstance(result, str) and result.strip()
     runner._handle_help_command.assert_not_awaited()
     fake_agent.interrupt.assert_not_called()
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages

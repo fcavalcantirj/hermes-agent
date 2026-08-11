@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Ця команда є в безумовному списку блокування, її не можна схвалити."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Я тут — пишіть будь-коли. /help покаже, що я вмію."
+  knock:
+    hold: "Хвилинку, будь ласка — я повідомив власника про ваш прихід. 🙏"
+    prompt_plain: "🚪 Новий користувач на {platform}: {user_name} ({user_id})\n\n«{message}»\n\n(На цій платформі немає кнопок схвалення — надайте доступ, додавши користувача до allowlist.)"
+    approved_user: "✅ Доступ надано! Вже відповідаю на ваше повідомлення."
+    stamp_approved: "✅ Схвалено: {approver}"
+    stamp_denied: "❌ Відхилено: {approver}"
+    not_allowed: "⛔ Вирішувати можуть лише налаштовані затверджувачі."
   approval_expired: "⚠️ Час схвалення минув (агент більше не очікує). Попросіть агента спробувати ще раз."
   draining:         "⏳ Очікування завершення {count} активних агент(ів) перед перезапуском..."
   goal_cleared:     "✓ Ціль очищено."

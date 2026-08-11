@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Ez a parancs a feltétel nélküli tiltólistán van, és nem hagyható jóvá."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Itt vagyok — írj bármikor. A /help megmutatja, mit tudok."
+  knock:
+    hold: "Egy pillanat — szóltam a gazdámnak, hogy megérkeztél. 🙏"
+    prompt_plain: "🚪 Új felhasználó itt: {platform}: {user_name} ({user_id})\n\n„{message}”\n\n(Ezen a platformon nincs jóváhagyó gomb — az allowlisthez adva engedélyezheted.)"
+    approved_user: "✅ Jóváhagyva! Máris válaszolok az üzenetedre."
+    stamp_approved: "✅ Jóváhagyta: {approver}"
+    stamp_denied: "❌ Elutasította: {approver}"
+    not_allowed: "⛔ Ezt csak a beállított jóváhagyók dönthetik el."
   approval_expired: "⚠️ A jóváhagyás lejárt (az ügynök már nem vár). Kérd meg az ügynököt, hogy próbálja újra."
   draining:         "⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt..."
   goal_cleared:     "✓ A cél törölve."

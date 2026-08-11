@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Bu komut koşulsuz engelleme listesinde ve onaylanamaz."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Buradayım — istediğin zaman mesaj at. /help neler yapabildiğimi gösterir."
+  knock:
+    hold: "Bir dakika lütfen — sahibime geldiğinizi bildirdim. 🙏"
+    prompt_plain: "🚪 {platform} üzerinde yeni kullanıcı: {user_name} ({user_id})\n\n“{message}”\n\n(Bu platformda onay düğmesi yok — kullanıcıyı allowlist'e ekleyerek erişim verin.)"
+    approved_user: "✅ Onaylandı! Mesajını şimdi yanıtlıyorum."
+    stamp_approved: "✅ {approver} onayladı"
+    stamp_denied: "❌ {approver} reddetti"
+    not_allowed: "⛔ Bunu yalnızca yapılandırılmış onaylayıcılar çözebilir."
   approval_expired: "⚠️ Onay süresi doldu (ajan artık beklemiyor). Ajanın tekrar denemesini isteyin."
   draining:         "⏳ Yeniden başlatmadan önce {count} aktif ajan bekleniyor..."
   goal_cleared:     "✓ Hedef temizlendi."

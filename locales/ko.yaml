@@ -20,6 +20,16 @@ approval:
   blocklist_message: "이 명령은 무조건 차단 목록에 있으며 승인할 수 없습니다."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 여기 있어요 — 언제든 메시지를 보내세요. /help 로 기능을 확인하세요."
+  knock:
+    hold: "잠시만요 — 소유자에게 승인을 요청했습니다. 🙏"
+    prompt_plain: "🚪 {platform} 새 사용자: {user_name} ({user_id})\n\n“{message}”\n\n(이 플랫폼에는 승인 버튼이 없습니다 — allowlist에 추가하여 접근을 허용하세요.)"
+    approved_user: "✅ 승인되었습니다! 지금 메시지에 답하고 있어요."
+    stamp_approved: "✅ {approver} 승인"
+    stamp_denied: "❌ {approver} 거부"
+    not_allowed: "⛔ 설정된 승인자만 처리할 수 있습니다."
   approval_expired: "⚠️ 승인이 만료되었습니다 (에이전트가 더 이상 대기하지 않습니다). 에이전트에게 다시 시도하도록 요청하세요."
   draining:         "⏳ 재시작 전에 활성 에이전트 {count}명을 정리하는 중..."
   goal_cleared:     "✓ 목표가 삭제되었습니다."

@@ -20,6 +20,16 @@ approval:
   blocklist_message: "このコマンドは無条件ブロックリストに含まれており、承認できません。"
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 ここにいます — いつでもメッセージをどうぞ。/help で機能を確認できます。"
+  knock:
+    hold: "少々お待ちください — オーナーに確認を依頼しました。🙏"
+    prompt_plain: "🚪 {platform} に新しいユーザー: {user_name} ({user_id})\n\n「{message}」\n\n(このプラットフォームには承認ボタンがありません — allowlist に追加してアクセスを許可してください。)"
+    approved_user: "✅ 承認されました！メッセージにお答えします。"
+    stamp_approved: "✅ {approver} が承認"
+    stamp_denied: "❌ {approver} が拒否"
+    not_allowed: "⛔ 設定された承認者のみが操作できます。"
   approval_expired: "⚠️ 承認の有効期限が切れました（エージェントはもう待機していません）。エージェントに再試行を依頼してください。"
   draining:         "⏳ 再起動前に {count} 個のアクティブエージェントの終了を待っています..."
   goal_cleared:     "✓ 目標をクリアしました。"

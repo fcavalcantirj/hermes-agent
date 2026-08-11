@@ -4153,6 +4153,19 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "messaging",
     },
+    "TELEGRAM_PAIRING_APPROVERS": {
+        "description": "Comma-separated Telegram user IDs who approve/deny NEW users (knock flow). When set, unknown DMs are held for an in-chat approve/deny instead of being ignored",
+        "prompt": "Telegram approver user IDs for new-user requests (comma-separated, optional)",
+        "url": "https://t.me/userinfobot",
+        "password": False,
+        "category": "messaging",
+    },
+    "HERMES_KNOCK_HOLD_MESSAGE": {
+        "description": "Override for the message an unknown user sees while waiting for knock approval (defaults to a localized built-in)",
+        "prompt": "Hold message for unapproved new users (optional)",
+        "password": False,
+        "category": "messaging",
+    },
     "TELEGRAM_PROXY": {
         "description": "Proxy URL for Telegram connections (overrides HTTPS_PROXY). Supports http://, https://, socks5://",
         "prompt": "Telegram proxy URL (optional)",

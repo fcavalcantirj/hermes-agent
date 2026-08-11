@@ -20,6 +20,16 @@ approval:
   blocklist_message: "此命令位于无条件拦截列表中，无法被批准。"
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 我在这里 — 随时给我发消息。/help 查看我的功能。"
+  knock:
+    hold: "请稍等 — 我已通知主人您的到来。🙏"
+    prompt_plain: "🚪 {platform} 上的新用户：{user_name}（{user_id}）\n\n“{message}”\n\n（此平台没有审批按钮 — 请将该用户加入 allowlist 以授权。）"
+    approved_user: "✅ 已通过！我这就回复您的消息。"
+    stamp_approved: "✅ 由 {approver} 批准"
+    stamp_denied: "❌ 由 {approver} 拒绝"
+    not_allowed: "⛔ 只有配置的审批人才能处理。"
   approval_expired: "⚠️ 批准已过期（代理不再等待）。请让代理重试。"
   draining:         "⏳ 正在等待 {count} 个活跃代理结束后重启..."
   goal_cleared:     "✓ 目标已清除。"

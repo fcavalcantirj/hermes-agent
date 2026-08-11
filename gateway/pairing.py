@@ -405,6 +405,117 @@ class PairingStore:
                 return True
         return False
 
+    # ----- Knock requests (owner-approved onboarding, no codes) -----
+    #
+    # A "knock" is an unknown DM held for explicit owner approval: the
+    # requester's first message is stored, the configured approvers get an
+    # approve/deny prompt in-platform, and the grant lands via _approve_user
+    # (so the allowlist mirror and the authz union both apply). Denials are
+    # remembered so a denied user never re-knocks.
+
+    def _knock_path(self, platform: str) -> Path:
+        return self._dir / f"{platform}-knock.json"
+
+    def _load_knock(self, platform: str) -> dict:
+        data = self._load_json(self._knock_path(platform))
+        data.setdefault("pending", {})
+        data.setdefault("denied", {})
+        return data
+
+    def is_knock_denied(self, platform: str, user_id: str) -> bool:
+        """True when this user was explicitly denied by an approver."""
+        denied = self._load_knock(platform)["denied"]
+        return any(self._user_ids_match(platform, d, user_id) for d in denied)
+
+    def knock_pending(self, platform: str, user_id: str) -> Optional[dict]:
+        """Return the pending knock record for a user, or None."""
+        pending = self._load_knock(platform)["pending"]
+        for uid, record in pending.items():
+            if self._user_ids_match(platform, uid, user_id):
+                return record
+        return None
+
+    def create_knock(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str,
+        chat_id: str,
+        message: str,
+    ) -> bool:
+        """Record a new knock. False when one is already pending or the user
+        was denied — callers stay silent in both cases."""
+        with self._lock:
+            data = self._load_knock(platform)
+            if self.is_knock_denied(platform, user_id):
+                return False
+            if self.knock_pending(platform, user_id) is not None:
+                return False
+            normalized = self._normalize_user_id(platform, user_id)
+            data["pending"][normalized] = {
+                "user_name": str(user_name or ""),
+                "chat_id": str(chat_id or ""),
+                "message": str(message or "")[:4000],
+                "requested_at": time.time(),
+                "prompts": [],
+            }
+            self._save_json(self._knock_path(platform), data)
+            return True
+
+    def add_knock_prompt(
+        self, platform: str, user_id: str, chat_id: str, message_id: int
+    ) -> None:
+        """Track an approver prompt message so it can be edited on resolve."""
+        with self._lock:
+            data = self._load_knock(platform)
+            for uid, record in data["pending"].items():
+                if self._user_ids_match(platform, uid, user_id):
+                    record.setdefault("prompts", []).append(
+                        {"chat_id": str(chat_id), "message_id": message_id}
+                    )
+                    self._save_json(self._knock_path(platform), data)
+                    return
+
+    def _pop_knock(self, platform: str, user_id: str) -> Optional[dict]:
+        """Remove and return the pending knock. Must run under self._lock."""
+        data = self._load_knock(platform)
+        for uid in list(data["pending"]):
+            if self._user_ids_match(platform, uid, user_id):
+                record = data["pending"].pop(uid)
+                self._save_json(self._knock_path(platform), data)
+                return record
+        return None
+
+    def approve_knock(
+        self, platform: str, user_id: str, approved_by: str = ""
+    ) -> Optional[dict]:
+        """Resolve a knock as approved: grant the user (allowlist mirror
+        included) and return the stored record. None when nothing was pending."""
+        with self._lock:
+            record = self._pop_knock(platform, user_id)
+            if record is None:
+                return None
+            self._approve_user(platform, user_id, record.get("user_name", ""))
+            record["approved_by"] = str(approved_by or "")
+            return record
+
+    def deny_knock(
+        self, platform: str, user_id: str, denied_by: str = ""
+    ) -> Optional[dict]:
+        """Resolve a knock as denied and remember the denial."""
+        with self._lock:
+            record = self._pop_knock(platform, user_id)
+            if record is None:
+                return None
+            data = self._load_knock(platform)
+            data["denied"][self._normalize_user_id(platform, user_id)] = {
+                "user_name": record.get("user_name", ""),
+                "denied_at": time.time(),
+                "denied_by": str(denied_by or ""),
+            }
+            self._save_json(self._knock_path(platform), data)
+            return record
+
     # ----- Pending codes -----
 
     @staticmethod

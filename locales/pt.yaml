@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Este comando está na lista de bloqueio incondicional e não pode ser aprovado."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Estou aqui — pode me mandar uma mensagem. /help mostra o que eu sei fazer."
+  knock:
+    hold: "Um momento, por favor — avisei meu responsável que você chegou. 🙏"
+    prompt_plain: "🚪 Novo usuário em {platform}: {user_name} ({user_id})\n\n“{message}”\n\n(Esta plataforma não tem botões de aprovação — libere adicionando o usuário à allowlist.)"
+    approved_user: "✅ Liberado! Já estou respondendo sua mensagem."
+    stamp_approved: "✅ Aprovado por {approver}"
+    stamp_denied: "❌ Negado por {approver}"
+    not_allowed: "⛔ Só aprovadores configurados podem resolver isto."
   approval_expired: "⚠️ A aprovação expirou (o agente já não está à espera). Peça ao agente para tentar novamente."
   draining:         "⏳ A aguardar que {count} agente(s) ativo(s) terminem antes de reiniciar..."
   goal_cleared:     "✓ Objetivo removido."

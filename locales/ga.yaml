@@ -24,6 +24,16 @@ approval:
   blocklist_message: "Tá an t-ordú seo ar an liosta cosc gan choinníoll agus ní féidir é a cheadú."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Táim anseo — seol teachtaireacht chugam am ar bith. Taispeánann /help a bhfuil ar mo chumas."
+  knock:
+    hold: "Fan nóiméad, le do thoil — chuir mé in iúl do m'úinéir go bhfuil tú anseo. 🙏"
+    prompt_plain: "🚪 Úsáideoir nua ar {platform}: {user_name} ({user_id})\n\n“{message}”\n\n(Níl cnaipí ceadaithe ar an ardán seo — tabhair rochtain tríd an úsáideoir a chur leis an allowlist.)"
+    approved_user: "✅ Ceadaithe! Táim ag freagairt do theachtaireachta anois."
+    stamp_approved: "✅ Ceadaithe ag {approver}"
+    stamp_denied: "❌ Diúltaithe ag {approver}"
+    not_allowed: "⛔ Ní féidir ach le ceadaitheoirí cumraithe é seo a réiteach."
   approval_expired: "⚠️ Tá an cead imithe in éag (níl an gníomhaire ag fanacht níos mó). Iarr ar an ngníomhaire iarracht eile a dhéanamh."
   draining:         "⏳ Ag fanacht le {count} gníomhaire(í) gníomhach roimh atosú..."
   goal_cleared:     "✓ Sprioc glanta."

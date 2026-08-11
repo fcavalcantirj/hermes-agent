@@ -20,6 +20,16 @@ approval:
   blocklist_message: "Hierdie opdrag is op die onvoorwaardelike blokkeerlys en kan nie goedgekeur word nie."
 
 gateway:
+  # /start greeting + knock (owner-approved onboarding) strings.
+  start:
+    greeting: "👋 Ek is hier — stuur my enige tyd 'n boodskap. /help wys wat ek kan doen."
+  knock:
+    hold: "Net 'n oomblik — ek het my eienaar laat weet jy is hier. 🙏"
+    prompt_plain: "🚪 Nuwe gebruiker op {platform}: {user_name} ({user_id})\n\n“{message}”\n\n(Hierdie platform het nie goedkeuringsknoppies nie — gee toegang deur die gebruiker by die allowlist te voeg.)"
+    approved_user: "✅ Goedgekeur! Ek antwoord nou jou boodskap."
+    stamp_approved: "✅ Goedgekeur deur {approver}"
+    stamp_denied: "❌ Geweier deur {approver}"
+    not_allowed: "⛔ Slegs opgestelde goedkeurders kan dit besluit."
   approval_expired: "⚠️ Goedkeuring het verval (die agent wag nie meer nie). Vra die agent om weer te probeer."
   draining:         "⏳ Wag vir {count} aktiewe agent(e) voor herbegin..."
   goal_cleared:     "✓ Doelwit verwyder."
