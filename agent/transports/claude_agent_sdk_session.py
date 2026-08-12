@@ -1099,6 +1099,25 @@ class ClaudeAgentSdkSession:
                     subtype = getattr(message, "subtype", "") or ""
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", None) or []
+                        if subtype == "success" and not errors:
+                            # Contradictory envelope: is_error=True yet
+                            # subtype="success" with nothing in errors. The
+                            # CLI emits this shape rarely (2026-08-11: it
+                            # killed a cron run as "RuntimeError: SDK result
+                            # error (subtype=success): success" — a dead job
+                            # over a turn that had actually produced its
+                            # answer). There is no error to report, so the
+                            # error flag loses to the subtype; kept loud for
+                            # diagnosis. A genuine failure carries a non-empty
+                            # errors list or a non-success subtype and still
+                            # takes the honest path below.
+                            logger.warning(
+                                "claude-agent-sdk: contradictory result "
+                                "envelope (is_error=True, subtype=success, "
+                                "no errors) — treated as success: %r",
+                                message,
+                            )
+                            break
                         err_text = (
                             f"SDK result error (subtype={subtype}): "
                             + ("; ".join(str(e) for e in errors) or subtype)

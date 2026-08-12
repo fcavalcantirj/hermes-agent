@@ -388,6 +388,29 @@ class TestSession:
         assert turn.error is not None
         assert "error_max_turns" in turn.error
 
+    def test_contradictory_success_envelope_not_an_error(self):
+        # 2026-08-11 incident: the CLI emitted is_error=True with
+        # subtype="success" and an empty errors list; the fabricated
+        # "SDK result error (subtype=success): success" killed the cron
+        # job that had already produced its answer. The contradictory
+        # envelope loses to its own subtype. A genuine failure keeps the
+        # honest path: non-empty errors (see test_auth_error_marks_retire,
+        # same subtype) or a non-success subtype.
+        script = [
+            AssistantMessage(content=[TextBlock("nightly summary saved")]),
+            ResultMessage(
+                result="nightly summary saved", is_error=True, subtype="success"
+            ),
+        ]
+        session, _ = _make_session(script=script)
+        try:
+            turn = session.run_turn("consolidate")
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "nightly summary saved"
+        assert not turn.should_retire
+
     def test_auth_error_marks_retire(self):
         script = [
             ResultMessage(
