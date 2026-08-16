@@ -447,6 +447,21 @@ def classify_auth_failure(*parts: str) -> Optional[str]:
 def check_claude_sdk_available() -> tuple[bool, str]:
     """Preflight: the optional SDK extra must be importable, and it bundles /
     locates the Claude Code CLI itself. Mirrors check_codex_binary()."""
+    # Fast path FIRST: when the SDK already imports, never enter the lazy
+    # installer. ensure() can shell out to `uv pip install` and calls
+    # importlib.invalidate_caches(); doing either immediately before importing
+    # claude_agent_sdk -> mcp -> anyio rewrites site-packages and drops import
+    # caches under a live interpreter, which intermittently surfaces as
+    #     KeyError: 'anyio'
+    # from importlib._bootstrap._find_and_load — a hard, flaky session-start
+    # failure on installs where the extra is ALREADY present.
+    try:
+        import claude_agent_sdk  # noqa: F401
+
+        return True, "ok"
+    except ImportError:
+        pass
+
     # Lazy-install lane, mirroring agent/anthropic_adapter._get_anthropic_sdk:
     # the extra is opt-in (excluded from [all]), so first use on a lean
     # install goes through tools.lazy_deps.ensure. FeatureUnavailable falls
