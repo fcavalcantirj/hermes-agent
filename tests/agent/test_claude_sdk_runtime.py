@@ -2618,8 +2618,41 @@ class TestSdkAvailabilityGate:
             called["prompt"] = prompt
 
         monkeypatch.setattr(lazy_deps, "ensure", fake_ensure)
+        # Pin the LEAN install this lane exists for: a None entry in
+        # sys.modules makes `import claude_agent_sdk` raise ImportError.
+        import sys as _sys
+
+        monkeypatch.setitem(_sys.modules, "claude_agent_sdk", None)
         check_claude_sdk_available()
         assert called == {"feature": "provider.claude_agent_sdk", "prompt": False}
+
+    def test_check_skips_lazy_lane_when_sdk_already_imports(self, monkeypatch):
+        # ensure() can shell out to `uv pip install` and calls
+        # importlib.invalidate_caches(). Running it immediately before
+        # `import claude_agent_sdk -> mcp -> anyio` rewrites site-packages and
+        # drops import caches under a live interpreter, intermittently
+        # corrupting that very import ("KeyError: 'anyio'" out of
+        # importlib._bootstrap._find_and_load). When the extra is ALREADY
+        # importable the installer must not run at all.
+        import sys as _sys
+        import types as _types
+
+        import tools.lazy_deps as lazy_deps
+        from agent.transports.claude_agent_sdk_session import (
+            check_claude_sdk_available,
+        )
+
+        called = {}
+
+        def fake_ensure(feature, *, prompt=True):
+            called["feature"] = feature
+
+        monkeypatch.setattr(lazy_deps, "ensure", fake_ensure)
+        monkeypatch.setitem(
+            _sys.modules, "claude_agent_sdk", _types.ModuleType("claude_agent_sdk")
+        )
+        assert check_claude_sdk_available() == (True, "ok")
+        assert called == {}
 
     def test_lazy_lane_pin_matches_pyproject_extra(self):
         # The LAZY_DEPS lane must mirror the pyproject extra in lockstep
