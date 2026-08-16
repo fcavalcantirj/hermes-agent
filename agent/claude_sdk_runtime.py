@@ -718,13 +718,27 @@ def run_claude_agent_sdk_turn(
         def _relay_stream_delta(text: str) -> None:
             # Late-bound: the gateway assigns stream_delta_callback per turn
             # AFTER the session exists (and clears it between turns).
-            callback = getattr(agent, "stream_delta_callback", None)
-            if callback is None:
-                return
-            try:
-                callback(text)
-            except Exception:
-                logger.debug("stream delta relay raised", exc_info=True)
+            # Fan out to BOTH display sinks, mirroring the native runtimes
+            # (run_agent.py: [self.stream_delta_callback, self._stream_callback]).
+            # `stream_delta_callback` is the CLI/TUI sink. `_stream_callback` is
+            # the one the JSON-RPC gateway installs via run_conversation's
+            # `stream_callback=` kwarg, and that is the sink the DESKTOP listens
+            # on (it feeds the `message.delta` notification). Relaying only to
+            # the first meant the desktop never streamed on this runtime, no
+            # matter how the operator set display.streaming.
+            callbacks = [
+                cb
+                for cb in (
+                    getattr(agent, "stream_delta_callback", None),
+                    getattr(agent, "_stream_callback", None),
+                )
+                if cb is not None
+            ]
+            for cb in callbacks:
+                try:
+                    cb(text)
+                except Exception:
+                    logger.debug("stream delta relay raised", exc_info=True)
 
         append = build_system_prompt_append(
             platform=getattr(agent, "platform", None),
@@ -1034,11 +1048,28 @@ def run_claude_agent_sdk_turn(
     )
     usage_result = _record_claude_sdk_usage(agent, turn)
 
+    # Is the post-turn review routed OFF this runtime? Resolved here because
+    # the skills gate below depends on it.
+    _review_routed = False
+    try:
+        from agent.background_review import _resolve_review_runtime
+
+        _review_routed = bool(_resolve_review_runtime(agent).get("routed"))
+    except Exception:
+        logger.debug("review-runtime resolution raised", exc_info=True)
+
     should_review_skills = False
     if (
         agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
+        # `agent.valid_tool_names` is the SDK SESSION's surface, which never
+        # contains skill_manage on this runtime by design (the append even
+        # strips guidance naming it). But the agent that would call
+        # skill_manage is the REVIEW FORK, and a routed fork is an ordinary
+        # Hermes agent carrying the full toolset. Gating on the SDK session's
+        # tools therefore disabled skill review permanently here — memory
+        # review worked while skill review silently never fired.
+        and ("skill_manage" in agent.valid_tool_names or _review_routed)
     ):
         should_review_skills = True
         agent._iters_since_skill = 0
@@ -1068,13 +1099,7 @@ def run_claude_agent_sdk_turn(
         # fork is an ordinary Hermes agent with the full tool surface, so the
         # self-improvement loop behaves exactly as on the native runtimes.
         # Mirrors the codex_app_server -> codex_responses downgrade. (#25267)
-        _review_routed = False
-        try:
-            from agent.background_review import _resolve_review_runtime
-
-            _review_routed = bool(_resolve_review_runtime(agent).get("routed"))
-        except Exception:
-            logger.debug("review-runtime resolution raised", exc_info=True)
+        # `_review_routed` is resolved once above (the skills gate needs it too).
 
         if _review_routed:
             try:
