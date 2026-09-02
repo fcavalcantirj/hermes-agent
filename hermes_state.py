@@ -10016,12 +10016,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model: Optional[str] = None,
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
         api_call_count: int = 1,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
@@ -10040,6 +10043,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         forks record an aggregate of N fork API calls in one write with
         ``task='background_review'`` (issue #87250).
 
+        Optional billing/cost metadata is persisted on the same task row; it
+        is never inherited from the session's main route.
+
         Best-effort by contract: callers must never fail an aux call because
         accounting failed.
         """
@@ -10057,7 +10063,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 model=model,
                 billing_provider=billing_provider,
                 billing_base_url=billing_base_url,
-                billing_mode=None,
+                billing_mode=billing_mode,
                 input_tokens=input_tokens or 0,
                 output_tokens=output_tokens or 0,
                 cache_read_tokens=cache_read_tokens or 0,
@@ -10065,8 +10071,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 reasoning_tokens=reasoning_tokens or 0,
                 estimated_cost_usd=estimated_cost_usd,
                 actual_cost_usd=None,
-                cost_status=None,
-                cost_source=None,
+                cost_status=cost_status,
+                cost_source=cost_source,
                 api_call_count=(
                     1 if api_call_count is None else int(api_call_count)
                 ),

@@ -87,7 +87,9 @@ def record_aux_usage(
 
     The model is read from ``response.model`` (accurate even after the aux
     client's provider-fallback chains); *provider*/*base_url* reflect the
-    originally-resolved route and are best-effort.
+    originally-resolved route and are best-effort. Billing mode and cost
+    status come from the same canonical pricing resolver as main-loop usage,
+    so subscription auxiliaries are recorded as included rather than unknown.
     """
     try:
         if not task or task in _EXCLUDED_TASKS:
@@ -100,7 +102,11 @@ def record_aux_usage(
         if raw_usage is None:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            estimate_usage_cost,
+            normalize_usage,
+            resolve_billing_route,
+        )
 
         usage = normalize_usage(raw_usage, provider=provider)
         if not (
@@ -112,12 +118,21 @@ def record_aux_usage(
 
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
+        billing_mode = None
+        cost_status = None
+        cost_source = None
         try:
+            route = resolve_billing_route(
+                model, provider=provider, base_url=base_url
+            )
+            billing_mode = route.billing_mode
             cost = estimate_usage_cost(
                 model, usage, provider=provider, base_url=base_url
             )
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
+            cost_status = cost.status
+            cost_source = cost.source
         except Exception:
             logger.debug("Aux usage cost estimation failed", exc_info=True)
 
@@ -127,12 +142,15 @@ def record_aux_usage(
             model=model,
             billing_provider=provider,
             billing_base_url=base_url,
+            billing_mode=billing_mode,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
             cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             estimated_cost_usd=estimated_cost,
+            cost_status=cost_status,
+            cost_source=cost_source,
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

@@ -20,15 +20,15 @@ persistent ``claude`` process.
 
 This client closes that gap natively: it runs a ONE-SHOT
 ``claude_agent_sdk.query()`` against the SAME subscription the main lane
-already uses.  Nothing metered is involved, so the billing contract the
-fail-closed guard protects is preserved rather than bypassed, and ``auto``
-can finally mean "the model actually in use".
+already uses.  The child still reports its selected billing lane, so this
+adapter applies the same API-key and Extra Usage fail-closed checks as the
+persistent SDK session before accepting any result.
 
 Design constraints
 ------------------
 * **Text only.**  Auxiliary tasks (compression, title generation, web
-  extraction, ...) summarise text; they must never touch the filesystem or
-  spawn child MCP servers.  ``tools=[]`` removes the built-in Claude Code
+  extraction, ...) summarise text; image/file blocks fail explicitly instead
+  of being silently dropped.  ``tools=[]`` removes the built-in Claude Code
   tools (``allowed_tools`` is only a permission allowlist), while
   ``mcp_servers={}`` keeps MCP tools absent.  This also avoids the cost of
   booting MCP servers for a one-line summary.
@@ -60,6 +60,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_TIMEOUT = 600.0
+_AUX_SYSTEM_GUARD = (
+    "You are performing a non-interactive auxiliary text task for Hermes. "
+    "Follow the trusted system instructions, return the requested answer "
+    "directly, do not use tools, and do not ask follow-up questions."
+)
+_UNSUPPORTED_BLOCK_TYPES = {
+    "file",
+    "image",
+    "image_url",
+    "input_file",
+    "input_image",
+}
+_UNSUPPORTED_BLOCK_KEYS = {"file", "file_id", "image", "image_url"}
 # Advisory bound: asyncio's timeout cancellation must still be serviced by
 # aclose(), so a cancellation-hostile SDK teardown can exceed this interval.
 _QUERY_CLOSE_TIMEOUT = 5.0
@@ -99,15 +112,28 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
-def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
-    """Flatten chat messages for the SDK's one-shot string query surface."""
-    sections = [
-        "You are performing a non-interactive auxiliary text task for Hermes. "
-        "Return the requested answer directly; do not use tools or ask follow-up "
-        "questions.",
-    ]
+def _contains_unsupported_multimodal_content(content: Any) -> bool:
+    """Whether an OpenAI-shaped content value contains image/file input."""
+    if isinstance(content, list):
+        return any(_contains_unsupported_multimodal_content(item) for item in content)
+    if not isinstance(content, dict):
+        return False
+    block_type = str(content.get("type") or "").strip().lower()
+    if block_type in _UNSUPPORTED_BLOCK_TYPES:
+        return True
+    if any(key in content for key in _UNSUPPORTED_BLOCK_KEYS):
+        return True
+    nested = content.get("content")
+    return _contains_unsupported_multimodal_content(nested)
+
+
+def _messages_to_sdk_inputs(
+    messages: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """Keep trusted system instructions out of the SDK user prompt."""
+    system_sections = [_AUX_SYSTEM_GUARD]
+    prompt_sections: list[str] = []
     labels = {
-        "system": "System",
         "user": "User",
         "assistant": "Assistant",
         "tool": "Tool result",
@@ -119,10 +145,67 @@ def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
         if not rendered:
             continue
         role = str(message.get("role") or "context").strip().lower()
+        if role == "system":
+            system_sections.append(rendered)
+            continue
         label = labels.get(role, "Context")
-        sections.append(f"{label}:\n{rendered}")
-    sections.append("Complete the auxiliary task described above.")
-    return "\n\n".join(sections)
+        prompt_sections.append(f"{label}:\n{rendered}")
+    prompt_sections.append("Complete the trusted auxiliary task.")
+    return "\n\n".join(prompt_sections), "\n\n".join(system_sections)
+
+
+def _aux_billing_guard_error(message: Any, *, allow_metered: bool) -> str | None:
+    """Return a fail-closed billing error for one SDK stream message."""
+    if allow_metered:
+        return None
+
+    name = type(message).__name__
+    if name == "SystemMessage" and getattr(message, "subtype", "") == "init":
+        data = getattr(message, "data", None)
+        if not isinstance(data, dict):
+            return None
+        source = data.get("apiKeySource", data.get("api_key_source"))
+        if source is None:
+            return None
+        if str(source or "none").strip().lower() != "none":
+            return (
+                "claude-agent-sdk auxiliary billing guard: the CLI reported "
+                "a metered API-key source; remove it or explicitly enable "
+                "agent.claude_agent_sdk.allow_metered_key"
+            )
+        return None
+
+    if name != "RateLimitEvent":
+        return None
+    info = getattr(message, "rate_limit_info", None)
+    if info is None:
+        return None
+    raw = getattr(info, "raw", None)
+    raw = raw if isinstance(raw, dict) else {}
+    is_using_overage = raw.get("isUsingOverage")
+    overage_status = getattr(info, "overage_status", None)
+    if overage_status is None:
+        overage_status = raw.get("overageStatus")
+    rate_limit_type = getattr(info, "rate_limit_type", None)
+    if rate_limit_type is None:
+        rate_limit_type = raw.get("rateLimitType")
+
+    if is_using_overage is True or (
+        str(rate_limit_type or "").lower() == "overage"
+        and is_using_overage is not False
+    ):
+        return (
+            "claude-agent-sdk auxiliary billing guard: metered subscription "
+            "Extra Usage is active; disable Extra Usage or explicitly enable "
+            "agent.claude_agent_sdk.allow_metered_key"
+        )
+    if str(overage_status or "").lower() in {"allowed", "allowed_warning"}:
+        return (
+            "claude-agent-sdk auxiliary billing guard: subscription Extra "
+            "Usage is enabled and could become metered; disable Extra Usage "
+            "or explicitly enable agent.claude_agent_sdk.allow_metered_key"
+        )
+    return None
 
 
 def _run_coro_blocking(coro, timeout: float):
@@ -156,6 +239,7 @@ async def _collect_text(
     prompt: str,
     *,
     model: str,
+    system_prompt: str = _AUX_SYSTEM_GUARD,
     cancel_check: Callable[[], Any] | None = None,
     progress_hook: Callable[[], Any] | None = None,
 ) -> tuple[str, Any, str]:
@@ -185,7 +269,12 @@ async def _collect_text(
     # Import lazily to keep this lightweight facade importable without the
     # optional SDK extra.  The same override builder as the persistent lane is
     # load-bearing here: query() also spawns a CLI inheriting the parent env.
-    from agent.transports.claude_agent_sdk_session import _sdk_env_overrides
+    from agent.transports.claude_agent_sdk_session import (
+        _provider_flag,
+        _sdk_env_overrides,
+    )
+
+    allow_metered = _provider_flag("allow_metered_key")
 
     if cancel_check is None:
         cancel_requested = _aux_interrupt_cancel_requested
@@ -203,6 +292,7 @@ async def _collect_text(
 
     options = ClaudeAgentOptions(
         model=model,
+        system_prompt=system_prompt,
         tools=[],
         allowed_tools=[],
         mcp_servers={},
@@ -210,7 +300,7 @@ async def _collect_text(
         permission_mode="dontAsk",
         max_turns=1,
         include_partial_messages=True,
-        env=_sdk_env_overrides(),
+        env=_sdk_env_overrides(metered_allowed=allow_metered),
     )
 
     parts: list[str] = []
@@ -233,6 +323,12 @@ async def _collect_text(
             # hook for each consumed SDK message so long multi-call compression is
             # not mistaken for an idle/hung provider.
             notify_progress()
+            billing_error = _aux_billing_guard_error(
+                message,
+                allow_metered=allow_metered,
+            )
+            if billing_error is not None:
+                raise ClaudeSdkAuxError(billing_error)
             if isinstance(message, AssistantMessage):
                 for block in getattr(message, "content", None) or []:
                     # ThinkingBlock and friends are deliberately skipped -- aux
@@ -366,10 +462,9 @@ class _AuxCompletions:
                 "claude-agent-sdk auxiliary client does not support stream=True"
             )
 
-        # Validate the CALLER'S messages, not the assembled prompt:
-        # _messages_to_prompt always prepends the non-interactive UX guard, so
-        # an assembled-prompt emptiness check can never fire and an empty
-        # message list would burn a live subscription call sending boilerplate.
+        # Validate the CALLER'S messages, not the assembled prompt: the SDK
+        # inputs always contain a trusted guard, so checking those would let an
+        # empty message list burn a live subscription call on boilerplate.
         if not any(
             str((m or {}).get("content") or "").strip()
             for m in messages
@@ -377,13 +472,24 @@ class _AuxCompletions:
         ):
             raise ClaudeSdkAuxError("refusing to send an empty auxiliary prompt")
 
-        prompt = _messages_to_prompt(messages)
+        if any(
+            _contains_unsupported_multimodal_content((message or {}).get("content"))
+            for message in messages
+            if isinstance(message, dict)
+        ):
+            raise ClaudeSdkAuxError(
+                "claude-agent-sdk auxiliary client is text-only and refuses "
+                "image or file content"
+            )
+
+        prompt, system_prompt = _messages_to_sdk_inputs(messages)
 
         try:
             text, usage, stop_reason = _run_coro_blocking(
                 _collect_text(
                     prompt,
                     model=model,
+                    system_prompt=system_prompt,
                     cancel_check=cancel_check,
                     progress_hook=progress_hook,
                 ),

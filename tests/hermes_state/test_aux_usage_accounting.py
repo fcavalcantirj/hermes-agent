@@ -189,6 +189,33 @@ class TestAmbientAccountingContext:
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
 
+    def test_record_aux_usage_classifies_subscription_route(self, db):
+        """Aux subscription calls persist the same safe billing receipt as main."""
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="gpt-5.6-luna"),
+                "title_generation",
+                provider="openai-codex",
+            )
+        finally:
+            reset_accounting_context(token)
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        assert rows[0]["task"] == "title_generation"
+        assert rows[0]["billing_provider"] == "openai-codex"
+        assert rows[0]["billing_mode"] == "subscription_included"
+        assert rows[0]["cost_status"] == "included"
+        assert rows[0]["cost_source"] == "none"
+        assert rows[0]["estimated_cost_usd"] == 0.0
+
 
     def test_moa_tasks_excluded(self, db):
         """MoA advisor usage is already folded into the main-loop delta by
@@ -295,4 +322,3 @@ class TestInsightsAuxTotals:
         assert ov["total_output_tokens"] == 600
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
-
