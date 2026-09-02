@@ -32,10 +32,55 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 _TOOL_RESULT_MAX_CHARS = 4000
+_TOOL_RESULT_TRUNCATION_MARKER = "...[truncated]"
 
 
 def _sdk_type_name(obj: Any) -> str:
     return type(obj).__name__
+
+
+def _shrink_json_strings(value: Any, max_chars: int) -> Any:
+    """Return a shape-preserving copy with oversized string leaves shortened."""
+
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        keep = max(0, max_chars - len(_TOOL_RESULT_TRUNCATION_MARKER))
+        return value[:keep] + _TOOL_RESULT_TRUNCATION_MARKER
+    if isinstance(value, list):
+        return [_shrink_json_strings(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _shrink_json_strings(item, max_chars)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _truncate_tool_result_text(text: str) -> str:
+    """Cap projected tool text while preserving parseable structured receipts."""
+
+    if len(text) <= _TOOL_RESULT_MAX_CHARS:
+        return text
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return text[:_TOOL_RESULT_MAX_CHARS]
+
+    # Large delegate results commonly contain one long ``summary`` followed by
+    # route/billing metadata.  Head-only truncation makes the JSON invalid and
+    # drops that fail-closed receipt from persisted history.  Shrink string
+    # leaves progressively so the original object/list shape and metadata stay
+    # parseable.  Unusually huge structural payloads retain the legacy cap.
+    for max_chars in (2048, 1024, 512, 256, 128, 64):
+        compact = json.dumps(
+            _shrink_json_strings(decoded, max_chars),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(compact) <= _TOOL_RESULT_MAX_CHARS:
+            return compact
+    return text[:_TOOL_RESULT_MAX_CHARS]
 
 
 def _flatten_tool_result_content(content: Any) -> str:
@@ -43,7 +88,7 @@ def _flatten_tool_result_content(content: Any) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
-        return content[:_TOOL_RESULT_MAX_CHARS]
+        return _truncate_tool_result_text(content)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -57,8 +102,8 @@ def _flatten_tool_result_content(content: Any) -> str:
                         parts.append(repr(item))
             elif item is not None:
                 parts.append(str(item))
-        return "\n".join(parts)[:_TOOL_RESULT_MAX_CHARS]
-    return str(content)[:_TOOL_RESULT_MAX_CHARS]
+        return _truncate_tool_result_text("\n".join(parts))
+    return _truncate_tool_result_text(str(content))
 
 
 def _format_tool_args(d: Any) -> str:

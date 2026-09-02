@@ -11,6 +11,7 @@ retire the client rather than silently continue.
 """
 
 import asyncio
+import json
 import logging
 import sys
 import threading
@@ -241,6 +242,47 @@ class TestProjector:
             )
         )
         assert len(out.messages[0]["content"]) == 4000
+
+    def test_structured_tool_result_truncation_preserves_route_receipt(self):
+        p = ClaudeSdkEventProjector()
+        payload = {
+            "status": "completed",
+            "results": [
+                {
+                    "status": "completed",
+                    "summary": "worker output " * 1000,
+                    "route": "codex-luna",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "billing_mode": "subscription_included",
+                    "cost_status": "included",
+                }
+            ],
+            "mixed_routes": False,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+        }
+        out = p.project(
+            UserMessage(
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="t-route",
+                        content=json.dumps(payload),
+                    )
+                ]
+            )
+        )
+
+        projected = out.messages[0]["content"]
+        assert len(projected) <= 4000
+        decoded = json.loads(projected)
+        result = decoded["results"][0]
+        assert result["route"] == "codex-luna"
+        assert result["provider"] == "openai-codex"
+        assert result["model"] == "gpt-5.6-luna"
+        assert result["billing_mode"] == "subscription_included"
+        assert result["cost_status"] == "included"
+        assert result["summary"].endswith("...[truncated]")
 
     def test_result_message_sets_final_text(self):
         p = ClaudeSdkEventProjector()
@@ -1119,10 +1161,117 @@ class TestRuntimeGlue:
         assert result["agent_persisted"] is True
         assert result["cost_status"] == "included"
         assert result["cost_source"] == "claude-subscription"
+        assert result["session_id"] == agent.session_id
+        assert result["session_id"] != result["claude_sdk_session_id"]
         # Projected messages spliced after the (pre-appended) user turn.
         assert messages[-1]["content"] == "SDK_ASSISTANT"
         # Skill-nudge counter parity with the codex path.
         assert agent._iters_since_skill == 2
+
+    def test_terminal_commit_consumes_late_agent_interrupt_without_retiring(self):
+        agent = _make_agent()
+        session = agent._claude_sdk_session
+
+        def completed_then_stopped(*_args, **_kwargs):
+            agent._interrupt_requested = True
+            return _make_turn(terminal_result_accepted=True)
+
+        session.run_turn.side_effect = completed_then_stopped
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        assert result["completed"] is True
+        assert result["partial"] is False
+        assert result["interrupted"] is False
+        assert result["sdk_effects"]["interrupted"] is False
+        assert agent._interrupt_requested is False
+        assert agent._claude_sdk_session is session
+        session.consume_interrupt.assert_called_once_with()
+        session.close.assert_not_called()
+
+    def test_terminal_error_with_late_stop_stays_interrupted_and_cannot_fail_over(self):
+        agent = _make_agent()
+        session = agent._claude_sdk_session
+
+        def failed_then_stopped(*_args, **_kwargs):
+            agent._interrupt_requested = True
+            return _make_turn(
+                terminal_result_accepted=True,
+                error="SDK result error (subtype=error): rate limit",
+                api_error_status=429,
+                final_text="",
+                projected_messages=[],
+            )
+
+        session.run_turn.side_effect = failed_then_stopped
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        assert result["interrupted"] is True
+        assert result["failed"] is False
+        assert result.get("failover_reason") is None
+        assert result["sdk_effects"]["interrupted"] is True
+        assert agent._interrupt_requested is False
+        assert agent._claude_sdk_session is None
+        session.close.assert_called_once_with()
+
+    def test_nonterminal_retire_with_stop_consumes_agent_interrupt(self):
+        agent = _make_agent()
+        session = agent._claude_sdk_session
+
+        def retired_then_stopped(*_args, **_kwargs):
+            agent._interrupt_requested = True
+            return _make_turn(
+                should_retire=True,
+                error="SDK message stream ended before this turn's result",
+                projected_messages=[],
+                final_text="",
+                token_usage_last=None,
+            )
+
+        session.run_turn.side_effect = retired_then_stopped
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        assert result["interrupted"] is True
+        assert result["failed"] is False
+        assert agent._interrupt_requested is False
+
+    def test_raising_turn_with_stop_consumes_agent_interrupt(self):
+        agent = _make_agent()
+        session = agent._claude_sdk_session
+
+        def raised_then_stopped(*_args, **_kwargs):
+            agent._interrupt_requested = True
+            raise RuntimeError("SDK transport exploded")
+
+        session.run_turn.side_effect = raised_then_stopped
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        assert result["interrupted"] is True
+        assert result["failed"] is False
+        assert agent._interrupt_requested is False
 
     def test_compact_boundary_completes_once_before_turn_end(self, monkeypatch):
         """The stream boundary is primary; terminal completion is fallback only."""
@@ -1699,6 +1848,165 @@ class TestMcpEnvMinimal:
         session.close()
         assert holder["client"].disconnected is True
 
+    def test_in_process_mcp_is_ready_before_reader_and_first_query(
+        self, monkeypatch
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        events = []
+        holder = {}
+
+        class ReadinessClient(_FakeClient):
+            async def connect(self):
+                events.append("connect")
+
+            async def get_mcp_status(self):
+                events.append("status")
+                state = "pending" if events.count("status") == 1 else "connected"
+                return {
+                    "mcpServers": [
+                        {"name": "hermes-hybrid", "status": state},
+                        {"name": "remote", "status": "pending"},
+                    ]
+                }
+
+            async def receive_messages(self):
+                events.append("reader")
+                async for message in super().receive_messages():
+                    yield message
+
+        def factory(options=None):
+            holder["client"] = ReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        monkeypatch.setattr(
+            session,
+            "build_option_fields",
+            lambda: {
+                "mcp_servers": {
+                    "hermes-hybrid": {"type": "sdk", "instance": object()},
+                    "remote": {"type": "http", "url": "https://mcp.test"},
+                }
+            },
+        )
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_POLL_S", 0.0)
+        try:
+            session.ensure_started()
+            deadline = time.monotonic() + 5
+            while "reader" not in events and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            session.close()
+
+        assert session._sdk_mcp_server_names == ("hermes-hybrid",)
+        assert events[:3] == ["connect", "status", "status"]
+        assert "reader" in events
+        assert holder["client"].queried == []
+
+    def test_in_process_mcp_terminal_failure_aborts_before_reader_or_query(self):
+        holder = {}
+
+        class FailedReadinessClient(_FakeClient):
+            async def get_mcp_status(self):
+                return {
+                    "mcpServers": [
+                        {
+                            "name": "hermes-hybrid",
+                            "status": "failed",
+                            "error": "credential-shaped raw diagnostic",
+                        }
+                    ]
+                }
+
+        def factory(options=None):
+            holder["client"] = FailedReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                session.ensure_started()
+        finally:
+            session.close()
+
+        error = str(exc_info.value)
+        assert "hermes-hybrid=failed" in error
+        assert "credential-shaped" not in error
+        assert session._reader_task is None
+        assert holder["client"].queried == []
+        assert holder["client"].disconnected is True
+
+    def test_in_process_mcp_readiness_timeout_is_bounded_and_fail_closed(
+        self, monkeypatch
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        holder = {}
+
+        class PendingReadinessClient(_FakeClient):
+            async def get_mcp_status(self):
+                return {
+                    "mcpServers": [
+                        {"name": "hermes-hybrid", "status": "pending"}
+                    ]
+                }
+
+        def factory(options=None):
+            holder["client"] = PendingReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_TIMEOUT_S", 0.03)
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_POLL_S", 0.001)
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                session.ensure_started()
+        finally:
+            session.close()
+
+        assert time.monotonic() - started < 1.0
+        assert "hermes-hybrid=pending" in str(exc_info.value)
+        assert session._reader_task is None
+        assert holder["client"].queried == []
+
+    def test_missing_mcp_status_control_preserves_older_sdk_compatibility(
+        self, caplog
+    ):
+        session, holder = _make_session()
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        try:
+            with caplog.at_level(
+                logging.WARNING,
+                logger="agent.transports.claude_agent_sdk_session",
+            ):
+                session.ensure_started()
+            reader_started = session._reader_task is not None
+        finally:
+            session.close()
+
+        assert reader_started is True
+        assert holder["client"].queried == []
+        assert any(
+            "MCP readiness unavailable" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_mid_stream_interrupt_breaks_and_discards_tail(self):
         # Validator HIGH test-gap: the /stop-arriving-DURING-streaming path
         # was never exercised at session level.
@@ -1942,6 +2250,159 @@ class TestStreamOwnership:
         assert holder["client"].queried == ["foreground question"]
         assert session._stream_ended is not None
         assert session._turn_inbox is None
+
+    def test_stop_during_stream_death_release_handshake_stays_authoritative(self):
+        """A non-terminal stream death must observe stops admitted before release."""
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        holder = {}
+
+        class ReleaseRaceSession(ClaudeAgentSdkSession):
+            async def _reader_loop(self):
+                operation, inbox, claim_ack = await self._turn_claims.get()
+                assert operation == "claim"
+                self._turn_inbox = inbox
+                claim_ack.set_result(None)
+
+                while not self._client.queried:
+                    await asyncio.sleep(0)
+                inbox.put_nowait(sdk_session_mod._StreamEnd(error=None))
+
+                operation, release_inbox, release_ack = await self._turn_claims.get()
+                assert operation == "release"
+                assert release_inbox is inbox
+                self.request_interrupt()
+                self._turn_inbox = None
+                self._stream_ended = sdk_session_mod._StreamEnd(error=None)
+                release_ack.set_result(None)
+
+        def factory(options=None):
+            client = _FakeClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ReleaseRaceSession(cwd="/tmp", client_factory=factory)
+        try:
+            turn = session.run_turn("foreground question")
+        finally:
+            session.close()
+
+        assert turn.error is not None
+        assert turn.final_text == ""
+        assert turn.terminal_result_accepted is False
+        assert turn.interrupted is True
+        assert turn.should_retire is True
+        assert session._interrupt_event.is_set() is False
+        assert holder["client"].queried == ["foreground question"]
+        assert holder["client"].interrupted is True
+
+    def test_late_interrupt_after_terminal_release_does_not_downgrade_answer(self):
+        """A stop arriving after terminal commit belongs to the finished turn."""
+        holder = {}
+
+        class LateInterruptSession(ClaudeAgentSdkSession):
+            async def _consume_turn(self, prompt):
+                turn_data = await super()._consume_turn(prompt)
+                assert turn_data["result_uuid"] == "late-stop-result"
+                assert turn_data["final_text"] == "completed answer"
+                self.request_interrupt()
+                return turn_data
+
+        def factory(options=None):
+            client = _FakeClient(
+                options=options,
+                script=[
+                    ResultMessage(
+                        result="completed answer",
+                        uuid="late-stop-result",
+                        session_id="healthy-after-late-stop",
+                    )
+                ],
+            )
+            holder["client"] = client
+            return client
+
+        session = LateInterruptSession(cwd="/tmp", client_factory=factory)
+        try:
+            turn = session.run_turn("foreground question")
+            pending_after_turn = session._post_terminal_interrupt_pending
+        finally:
+            session.close()
+
+        assert turn.error is None
+        assert turn.final_text == "completed answer"
+        assert turn.turn_id == "late-stop-result"
+        assert turn.thread_id == "healthy-after-late-stop"
+        assert turn.terminal_result_accepted is True
+        assert turn.interrupted is False
+        assert turn.should_retire is False
+        assert session._interrupt_event.is_set() is False
+        assert pending_after_turn is False
+        assert holder["client"].queried == ["foreground question"]
+        assert holder["client"].interrupted is False
+
+    @pytest.mark.parametrize("exit_shape", ["stream_ended", "billing", "no_claims"])
+    def test_preclaim_early_exit_snapshots_interrupt(self, exit_shape):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        session, _ = _make_session(script=[ResultMessage(result="unused")])
+        try:
+            session.ensure_started()
+            session._interrupt_event.set()
+            if exit_shape == "stream_ended":
+                session._stream_ended = sdk_session_mod._StreamEnd(None)
+            elif exit_shape == "billing":
+                session._billing_guard_error = "metered billing refused"
+            else:
+                session._turn_claims = None
+            turn_data = session._run_coro(session._consume_turn("hi"), timeout=5.0)
+        finally:
+            session.close()
+
+        assert turn_data["interrupt_observed"] is True
+
+    def test_interrupt_admitted_during_terminal_projection_is_reported(
+        self, monkeypatch
+    ):
+        """Admission before commit and commit observation are one atomic boundary."""
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        projection_entered = threading.Event()
+        continue_projection = threading.Event()
+        original_projector = sdk_session_mod.ClaudeSdkEventProjector
+
+        class BlockingProjector(original_projector):
+            def project(self, message):
+                if type(message).__name__ == "ResultMessage":
+                    projection_entered.set()
+                    assert continue_projection.wait(timeout=5.0)
+                return super().project(message)
+
+        monkeypatch.setattr(
+            sdk_session_mod, "ClaudeSdkEventProjector", BlockingProjector
+        )
+        session, holder = _make_session(
+            script=[ResultMessage(result="answer", uuid="terminal-race")]
+        )
+        outcome = {}
+
+        def run_turn():
+            outcome["turn"] = session.run_turn("hi")
+
+        worker = threading.Thread(target=run_turn)
+        worker.start()
+        try:
+            assert projection_entered.wait(timeout=5.0)
+            session.request_interrupt()
+            continue_projection.set()
+            worker.join(timeout=10.0)
+            assert worker.is_alive() is False
+        finally:
+            continue_projection.set()
+            session.close()
+
+        assert outcome["turn"].interrupted is True
+        assert holder["client"].interrupted is True
 
     def test_offset_does_not_accumulate_across_unsolicited_turns(self):
         # The live incident: 4 unsolicited turns -> every later reply answered
@@ -2295,6 +2756,7 @@ class TestHermesSessionIdPlumbing:
         agent.session_cwd = "/unvalidated-stale-workspace"
         agent.skip_context_files = True
         agent.platform = "telegram"
+        agent.ephemeral_system_prompt = "# Explicit session skill\nUse delegate_task."
         run_claude_agent_sdk_turn(
             agent,
             user_message="hi",
@@ -2310,6 +2772,9 @@ class TestHermesSessionIdPlumbing:
         assert captured["model"] == "claude-opus-4-8"
         assert captured["cwd"] is None
         assert captured["include_project_context"] is False
+        assert captured["explicit_session_prompt"] == (
+            "# Explicit session skill\nUse delegate_task."
+        )
         assert session_captured["cwd"] == "/resolved-workspace"
 
         # A validated, explicitly configured context cwd is forwarded as an
@@ -2517,6 +2982,18 @@ class TestInterruptRoutesToSdkSession:
             turn2 = session.run_turn("second")
             assert turn2.interrupted is False
             assert holder["client"].queried == ["second"]
+        finally:
+            session.close()
+
+    def test_interrupt_between_completed_turns_targets_the_next_turn(self):
+        session, holder = _make_session(script=[ResultMessage(result="ok")])
+        try:
+            turn1 = session.run_turn("first")
+            assert turn1.interrupted is False
+            session.request_interrupt()
+            turn2 = session.run_turn("second")
+            assert turn2.interrupted is True
+            assert holder["client"].queried == ["first"]
         finally:
             session.close()
 
@@ -3021,6 +3498,91 @@ class TestContinuity:
         assert len(instances) == 1  # no second full-budget run
         assert result["partial"] is True
 
+    def test_late_stop_after_terminal_retire_does_not_retry(self, monkeypatch):
+        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        instances = []
+
+        class LateStopRetireSession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.inputs = []
+                instances.append(self)
+
+            def run_turn(self, user_input):
+                self.inputs.append(user_input)
+                agent._interrupt_requested = True
+                return _make_turn(
+                    should_retire=True,
+                    terminal_result_accepted=True,
+                    error="SDK result error (subtype=error): session retired",
+                    api_error_status=500,
+                    projected_messages=[],
+                    final_text="",
+                    token_usage_last=None,
+                )
+
+            def consume_interrupt(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            sdk_session_mod, "ClaudeAgentSdkSession", LateStopRetireSession
+        )
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert len(instances) == 1
+        assert instances[0].inputs == ["hi"]
+        assert result["interrupted"] is True
+        assert result["failed"] is False
+        assert result.get("failover_reason") is None
+
+    def test_raising_resumed_turn_with_stop_does_not_retry(self, monkeypatch):
+        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        instances = []
+
+        class RaisingStoppedSession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.inputs = []
+                instances.append(self)
+
+            def run_turn(self, user_input):
+                self.inputs.append(user_input)
+                agent._interrupt_requested = True
+                raise RuntimeError("resumed SDK transport exploded")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            sdk_session_mod, "ClaudeAgentSdkSession", RaisingStoppedSession
+        )
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert len(instances) == 1
+        assert instances[0].inputs == ["hi"]
+        assert result["interrupted"] is True
+        assert result["failed"] is False
+        assert agent._interrupt_requested is False
+
     def test_pre_turn_interrupt_short_circuit_reports_interrupted(self):
         # The top-of-turn short-circuit consumes a pre-turn /stop without a
         # model call. Its result dict must carry interrupted=True — without
@@ -3195,6 +3757,23 @@ class TestSystemPromptAppend:
         assert out is not None
         assert out.startswith("# I am the persona under test")
         assert "The user prefers concise results" in out
+
+    def test_explicit_session_prompt_is_seated_after_identity(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(
+            tmp_path,
+            monkeypatch,
+            soul="# SDK persona",
+        )
+        marker = "# Explicit session skill\nAlways use delegate_task."
+        out = build_system_prompt_append(explicit_session_prompt=marker)
+        assert out is not None
+        assert out.count(marker) == 1
+        assert out.index("# SDK persona") < out.index(marker)
+        assert out.index(marker) < out.index("Conversation started:")
 
     def test_native_soul_md_autoloads_when_append_file_unset(
         self, tmp_path, monkeypatch
@@ -7365,6 +7944,7 @@ class TestBargeInInterruptHandoff:
             turn = session.run_turn("hi", turn_timeout=10.0)
         finally:
             session.close()
+        assert turn.interrupted is True
         assert turn.error is not None
         # Stream death retires (the poisoned-session fix), interrupt or not.
         assert turn.should_retire is True
@@ -7704,6 +8284,7 @@ class TestTurnLifetime:
             session.close()
         assert turn.error is None
         assert turn.should_retire is False
+        assert turn.interrupted is False
         assert turn.final_text == "the answer"
 
     def test_success_ack_without_prior_text_stays_a_trip(self):

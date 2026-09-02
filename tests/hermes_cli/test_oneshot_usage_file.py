@@ -40,6 +40,19 @@ class TestWriteUsageFile:
         assert report["failed"] is False
         assert "failure" not in report
 
+    def test_report_keeps_hermes_parent_identity_separate_from_sdk_thread(self, tmp_path):
+        path = tmp_path / "usage.json"
+        _write_usage_file(
+            str(path),
+            _result(
+                session_id="hermes-parent-session",
+                claude_sdk_session_id="sdk-thread-child",
+            ),
+        )
+        report = json.loads(path.read_text())
+        assert report["session_id"] == "hermes-parent-session"
+        assert report["session_id"] != "sdk-thread-child"
+
     def test_none_path_is_noop(self, tmp_path):
         # Must not raise and must not create a report file.
         _write_usage_file(None, _result())
@@ -53,5 +66,4 @@ class TestWriteUsageFile:
         assert report["failure"] == "boom"
         # Missing result fields serialize as null, not KeyError.
         assert report["estimated_cost_usd"] is None
-
 
