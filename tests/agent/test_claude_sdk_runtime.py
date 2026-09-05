@@ -13,6 +13,7 @@ retire the client rather than silently continue.
 import asyncio
 import logging
 import sys
+import types
 import threading
 import time
 import tracemalloc
@@ -1617,6 +1618,166 @@ class TestHttpMcpSecurity:
             "type": "http",
             "url": "https://mcp.example.test/public",
         }
+
+
+class TestHybridRegistryDiff:
+    """The bridge is built from ``agent.tools``; servers that register after
+    that snapshot are in no bucket at all. These pin the diff that closes it."""
+
+    @staticmethod
+    def _spec(name):
+        return {
+            "type": "function",
+            "function": {"name": name, "description": name, "parameters": {}},
+        }
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        from agent.transports import hermes_hybrid_mcp
+
+        seen = {}
+
+        def _build(agent, tools, *, server_name, **kwargs):
+            seen[server_name] = list(tools)
+            return {"type": "sdk", "name": server_name}
+
+        monkeypatch.setattr(
+            hermes_hybrid_mcp, "build_hybrid_mcp_server", _build
+        )
+        return seen
+
+    @staticmethod
+    def _session(**kwargs):
+        return ClaudeAgentSdkSession(cwd="/tmp", **kwargs)
+
+    def _patch_registry(self, monkeypatch, specs, *, recorder=None):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        monkeypatch.setattr(
+            mod, "_provider_config", lambda: {"hybrid_mcp_bridge": True}
+        )
+        fake_mcp = types.SimpleNamespace(has_registered_mcp_tools=lambda: True)
+        monkeypatch.setitem(sys.modules, "tools.mcp_tool_discovery", fake_mcp)
+
+        def _defs(**kwargs):
+            if recorder is not None:
+                recorder.update(kwargs)
+            return specs
+
+        monkeypatch.setitem(
+            sys.modules, "model_tools",
+            types.SimpleNamespace(get_tool_definitions=_defs),
+        )
+
+    def test_late_registered_mcp_tool_reaches_the_extras_bucket(
+        self, monkeypatch, captured
+    ):
+        self._patch_registry(monkeypatch, [self._spec("mcp__late__do")])
+        session = self._session(
+            agent=object(), tools=[self._spec("read_file")]
+        )
+
+        session.build_option_fields()
+
+        hybrid = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-hybrid"]
+        ]
+        assert "mcp__late__do" in hybrid
+        # Legacy bucket is untouched: its grants must keep matching.
+        legacy = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-tools"]
+        ]
+        assert legacy == ["read_file"]
+
+    def test_tool_already_in_snapshot_is_not_registered_twice(
+        self, monkeypatch, captured
+    ):
+        self._patch_registry(monkeypatch, [self._spec("mcp__dup__do")])
+        session = self._session(
+            agent=object(), tools=[self._spec("mcp__dup__do")]
+        )
+
+        session.build_option_fields()
+
+        names = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-hybrid"]
+        ]
+        assert names.count("mcp__dup__do") == 1
+
+    def test_non_mcp_registry_entries_are_ignored(self, monkeypatch, captured):
+        self._patch_registry(monkeypatch, [self._spec("native_tool")])
+        session = self._session(
+            agent=object(), tools=[self._spec("read_file")]
+        )
+
+        session.build_option_fields()
+
+        names = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-hybrid"]
+        ]
+        assert "native_tool" not in names
+
+    def test_agent_toolset_gating_is_forwarded(self, monkeypatch, captured):
+        recorder = {}
+        self._patch_registry(monkeypatch, [], recorder=recorder)
+        agent = types.SimpleNamespace(
+            enabled_toolsets=["mcp-allowed"], disabled_toolsets=["mcp-banned"]
+        )
+        session = self._session(agent=agent, tools=[self._spec("read_file")])
+
+        session.build_option_fields()
+
+        assert recorder["enabled_toolsets"] == ["mcp-allowed"]
+        assert recorder["disabled_toolsets"] == ["mcp-banned"]
+
+    def test_registry_failure_leaves_the_bridge_unchanged(
+        self, monkeypatch, captured
+    ):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        monkeypatch.setattr(
+            mod, "_provider_config", lambda: {"hybrid_mcp_bridge": True}
+        )
+        boom = types.SimpleNamespace(
+            has_registered_mcp_tools=MagicMock(side_effect=RuntimeError("boom"))
+        )
+        monkeypatch.setitem(sys.modules, "tools.mcp_tool_discovery", boom)
+        session = self._session(
+            agent=object(), tools=[self._spec("read_file")]
+        )
+
+        fields = session.build_option_fields()
+
+        assert fields["mcp_servers"]["hermes-hybrid"]["type"] == "sdk"
+        names = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-hybrid"]
+        ]
+        assert names == ["read_file"]
+
+    def test_skip_mcp_refresh_opt_out_is_honoured(self, monkeypatch, captured):
+        """Background review sets this flag on purpose; the registry read must
+        not walk past it just because it bypasses the snapshot."""
+        self._patch_registry(monkeypatch, [self._spec("mcp__late__do")])
+        agent = types.SimpleNamespace(_skip_mcp_refresh=True)
+        session = self._session(agent=agent, tools=[self._spec("read_file")])
+
+        session.build_option_fields()
+
+        names = [
+            (t.get("function") or {}).get("name") for t in captured["hermes-hybrid"]
+        ]
+        assert "mcp__late__do" not in names
+
+    def test_no_registry_read_when_the_bridge_is_not_built(self, monkeypatch):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        probe = MagicMock(side_effect=AssertionError("must not read registry"))
+        monkeypatch.setattr(mod, "_mcp_registry_tool_specs", probe)
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+
+        session.build_option_fields()
+
+        probe.assert_not_called()
 
 
 # ---------- hermes session id plumbing to the MCP shims (#26567) ----------
@@ -6022,6 +6183,8 @@ class TestGatewayApprovalBridge:
         agent._delivered_interim_texts = set()
         agent._interim_text_was_delivered.side_effect = lambda text: text in agent._delivered_interim_texts
         agent._record_delivered_interim_text.side_effect = lambda text: agent._delivered_interim_texts.add(text)
+        # Nothing was streamed in this scenario, so the computed flag is False.
+        agent._interim_content_was_streamed.return_value = False
         delivered = []
         agent.interim_assistant_callback = lambda text, **kw: delivered.append((text, kw))
         run_claude_agent_sdk_turn(agent, user_message="one", original_user_message="one", messages=[{"role": "user", "content": "one"}], effective_task_id="one")
@@ -6032,6 +6195,92 @@ class TestGatewayApprovalBridge:
         assert "private" not in delivered[0][0]
         assert "12345678901234567890" not in delivered[0][0]
         assert delivered[0][1] == {"already_streamed": False}
+
+    def test_interim_is_not_sealed_when_no_sink_accepted(self, monkeypatch):
+        """Sealing a segment nobody painted would drop the prose from the UI.
+
+        The accumulator cannot answer this alone: it records before the sinks
+        run on purpose, so a turn whose only sink raises still has content in
+        it.
+        """
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        agent._strip_think_blocks.side_effect = lambda text: text
+        agent._interim_text_was_delivered.return_value = False
+        agent._interim_content_was_streamed.return_value = True
+        agent._stream_callback = None
+        agent.stream_delta_callback = MagicMock(side_effect=RuntimeError("sink down"))
+        delivered = []
+        agent.interim_assistant_callback = lambda text, **kw: delivered.append((text, kw))
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="one",
+            original_user_message="one",
+            messages=[{"role": "user", "content": "one"}],
+            effective_task_id="one",
+        )
+
+        captured["on_stream_delta"]("never painted")
+        captured["on_interim_assistant"]("never painted")
+        assert delivered[-1][1] == {"already_streamed": False}
+
+        agent.stream_delta_callback = MagicMock()
+        captured["on_stream_delta"]("painted")
+        captured["on_interim_assistant"]("painted")
+        assert delivered[-1][1] == {"already_streamed": True}
+
+    def test_sdk_interim_relay_reports_already_streamed_prose(self, monkeypatch):
+        """Prose the delta sink already painted must be sealed, not re-sent.
+
+        Hardcoding ``already_streamed=False`` made the surface render streamed
+        text a second time on top of the streaming buffer.
+        """
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        agent._strip_think_blocks.side_effect = lambda text: text
+        agent._interim_text_was_delivered.return_value = False
+        agent._interim_content_was_streamed.side_effect = lambda text: text == "already painted"
+        delivered = []
+        agent.interim_assistant_callback = lambda text, **kw: delivered.append((text, kw))
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="one",
+            original_user_message="one",
+            messages=[{"role": "user", "content": "one"}],
+            effective_task_id="one",
+        )
+        relay = captured["on_interim_assistant"]
+        # A sink accepted a delta this turn; the accumulator decides which
+        # prose it covered.
+        agent._sdk_stream_sink_accepted = True
+
+        relay("already painted")
+        relay("never streamed")
+
+        assert delivered[0] == ("already painted", {"already_streamed": True})
+        assert delivered[1] == ("never streamed", {"already_streamed": False})
 
     def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
         # CLI/bare-process posture unchanged: no context → callback stays None.
