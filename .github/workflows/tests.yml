@@ -12,6 +12,90 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  claude-sdk-packaging:
+    name: Claude SDK packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+
+      - name: Verify SDK-only install, co-install, and locked packaging tests
+        id: packaging
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HERMES_HOME: ${{ runner.temp }}/claude-sdk-packaging-home
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            tested_sha=$(git rev-parse HEAD)
+            test "$tested_sha" = "$EXPECTED_SHA"
+            echo "Tested SHA: $tested_sha"
+            uv --version
+            uv python install 3.11
+            uv venv --python 3.11 .venv
+            .venv/bin/python --version
+
+            # Exercise a user's minimal install before dev extras can mask a missing dependency.
+            # Use uv's resolver: it honors upstream's security overrides (unlike pip check).
+            uv pip install --python .venv/bin/python -e '.[claude-agent-sdk]'
+            .venv/bin/python - <<'PY'
+          from importlib import metadata
+          import claude_agent_sdk
+          import httpx2
+          import starlette
+          from mcp.server import MCPServer
+          from agent.transports.hermes_tools_mcp_server import main
+
+          for name in ("claude-agent-sdk", "mcp", "mcp-types", "httpx2", "starlette"):
+              print(f"{name}=={metadata.version(name)}")
+          assert callable(MCPServer) and callable(main)
+          print("SDK-only MCPServer and hermes-tools wrapper imports: OK")
+          PY
+            uv pip install --python .venv/bin/python -e '.[claude-agent-sdk,mcp]'
+            uv sync --locked --python 3.11 --extra dev --extra claude-agent-sdk --extra mcp
+            .venv/bin/python -c 'from importlib.metadata import version; print("Locked SDK:", version("claude-agent-sdk"))'
+            scripts/run_tests.sh -j 2 --file-retries 0 tests/test_packaging_metadata.py \
+              --junitxml="$RUNNER_TEMP/claude-sdk-packaging.xml"
+          } 2>&1 | tee "$RUNNER_TEMP/claude-sdk-packaging.log"
+
+      - name: Summarize packaging evidence
+        if: always()
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PACKAGING_OUTCOME: ${{ steps.packaging.outcome }}
+        shell: bash
+        run: |
+          {
+            echo '### Claude SDK packaging'
+            echo "Requested head: $EXPECTED_SHA"
+            echo "Result: $PACKAGING_OUTCOME"
+            echo 'See the claude-sdk-packaging artifact for commands, versions, and test results.'
+            echo 'No live provider call or subscription credentials are used by this job.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload packaging evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: claude-sdk-packaging
+          path: |
+            ${{ runner.temp }}/claude-sdk-packaging.log
+            ${{ runner.temp }}/claude-sdk-packaging.xml
+          retention-days: 30
+          if-no-files-found: warn
+
   test:
     name: Run tests
     # One 96-core runner for the whole suite. There is no slicing. Slicing
