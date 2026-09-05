@@ -12,6 +12,7 @@ call is mocked — we never actually shell out during unit tests.
 
 from __future__ import annotations
 
+import threading
 
 import os
 
@@ -161,6 +162,62 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_concurrent_ensure_rechecks_after_serialized_install(self, monkeypatch):
+        """Two first-use callers must share one environment mutation."""
+        feature = "test.concurrent"
+        spec = "zzzconcurrent==1.0"
+        monkeypatch.setitem(ld.LAZY_DEPS, feature, (spec,))
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+
+        state_lock = threading.Lock()
+        first_install_started = threading.Event()
+        second_initial_probe = threading.Event()
+        release_first_install = threading.Event()
+        state = {"installed": False, "install_calls": 0}
+
+        def is_satisfied(_spec):
+            with state_lock:
+                installed = state["installed"]
+            if threading.current_thread().name == "second-ensure":
+                second_initial_probe.set()
+            return installed
+
+        def install(_specs, **_kwargs):
+            with state_lock:
+                state["install_calls"] += 1
+                call_number = state["install_calls"]
+            if call_number == 1:
+                first_install_started.set()
+                assert release_first_install.wait(timeout=5)
+            with state_lock:
+                state["installed"] = True
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_is_satisfied", is_satisfied)
+        monkeypatch.setattr(ld, "_venv_pip_install", install)
+        errors = []
+
+        def run_ensure():
+            try:
+                ld.ensure(feature, prompt=False)
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=run_ensure, name="first-ensure")
+        second = threading.Thread(target=run_ensure, name="second-ensure")
+        first.start()
+        assert first_install_started.wait(timeout=5)
+        second.start()
+        assert second_initial_probe.wait(timeout=5)
+        release_first_install.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert state["install_calls"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +409,75 @@ class TestRefreshActiveFeatures:
 
 
 class TestInstallSpecs:
+    @pytest.mark.parametrize("policy,dry_run", [("core", False), ("plugin", False), ("plugin", True)])
+    def test_manifest_install_waits_for_core_install(self, monkeypatch, policy, dry_run):
+        """Both dependency policies share one environment; a dry-run must see settled state too."""
+        core_started = threading.Event()
+        contender_attempted = threading.Event()
+        release_core = threading.Event()
+        installed = threading.Event()
+        lock = threading.Lock()
+        calls, errors, results = [], [], []
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "manifest-install":
+                    contender_attempted.set()
+                lock.acquire()
+
+            def __exit__(self, *_exc):
+                lock.release()
+
+        def install(specs, **kwargs):
+            if specs == ("zzzcore==1.0",):
+                core_started.set()
+                assert release_core.wait(timeout=5)
+                installed.set()
+            else:
+                calls.append((installed.is_set(), specs, kwargs))
+                # Also unblock the driver if serialization regresses entirely.
+                contender_attempted.set()
+            return ld._InstallResult(True, "ok", "")
+
+        def run(call):
+            try:
+                results.append(call())
+            except BaseException as exc:
+                errors.append(exc)
+
+        monkeypatch.setattr(ld, "_INSTALL_LOCK", ObservedLock())
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.core", ("zzzcore==1.0",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: installed.is_set())
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(ld, "_lazy_install_target", lambda: None)
+        monkeypatch.setattr(ld, "_venv_pip_install", install)
+        core = threading.Thread(target=run, args=(lambda: ld.ensure("test.core", prompt=False),))
+        manifest = threading.Thread(
+            name="manifest-install", target=run,
+            args=(lambda: ld.install_specs(
+                ["zzzplugin==1.0"], constraints=["httpx>=0.28,<1"],
+                policy=policy, dry_run=dry_run, timeout=17,
+            ),),
+        )
+        core.start()
+        try:
+            assert core_started.wait(timeout=5)
+            manifest.start()
+            assert contender_attempted.wait(timeout=5)
+        finally:
+            release_core.set()
+            core.join(timeout=5)
+            if manifest.ident is not None:
+                manifest.join(timeout=5)
+
+        assert not core.is_alive() and not manifest.is_alive()
+        assert errors == []
+        assert calls == [(True, ("zzzplugin==1.0",), {
+            "timeout": 17, "constraint_lines": ("httpx>=0.28,<1",),
+            "dry_run": dry_run, "policy": policy,
+        })]
+        assert next(result for result in results if isinstance(result, ld.InstallSpecsResult)).ok
+
     @staticmethod
     def _capture_uv(monkeypatch):
         import subprocess
