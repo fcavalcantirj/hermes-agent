@@ -48,7 +48,7 @@ _HUMAN_WAIT_MAX_SESSIONS = 256
 HUMAN_WAIT_MARGIN_S = 60.0
 
 
-def human_wait_ceiling() -> float:
+def human_wait_ceiling(wait_seconds: float | None = None) -> float:
     """Max seconds a single window may contribute in this turn: the approval window + margin.
     On messaging platforms every legitimate human wait self-terminates at
     ``approvals.timeout`` (the gateway poll loop enforces it), so a window that
@@ -58,10 +58,14 @@ def human_wait_ceiling() -> float:
     acquire in agent/tool_executor.py, so the two cannot drift. Never call while
     holding ``_human_wait_lock`` — it reads the config cache.
     ``approval_wait_seconds`` caps at ``agent.deadline.MAX_SAFE_TIMEOUT_S`` so the
-    value is always safe for ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``."""
+    value is always safe for ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``.
+    *wait_seconds* is a caller's explicitly resolved approval window (the SDK gateway surface stays
+    at ``approvals.timeout``); ``None`` reads this turn's window."""
     from tools import approval_context
     from agent.deadline import MAX_SAFE_TIMEOUT_S
-    return min(MAX_SAFE_TIMEOUT_S, float(approval_context.approval_wait_seconds()) + HUMAN_WAIT_MARGIN_S)
+    if wait_seconds is None:
+        wait_seconds = approval_context.approval_wait_seconds()
+    return min(MAX_SAFE_TIMEOUT_S, float(wait_seconds) + HUMAN_WAIT_MARGIN_S)
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:
@@ -110,7 +114,7 @@ def activity_heartbeat(label: str):
 
 
 @contextlib.contextmanager
-def human_wait_window(session_key: str | None = None):
+def human_wait_window(session_key: str | None = None, *, wait_seconds: float | None = None):
     """Mark the enclosed block as time spent blocked on a human prompt. Wrap ONLY
     code that is genuinely parked waiting for a user's answer (the CLI approval
     prompt, the gateway approval poll loop). The concurrent tool batch deadline
@@ -122,7 +126,7 @@ def human_wait_window(session_key: str | None = None):
     See #79719.
     """
     key = _resolve_key(session_key)
-    ceiling = human_wait_ceiling()
+    ceiling = human_wait_ceiling(wait_seconds)
     now = time.monotonic()
     with _human_wait_lock:
         state = _human_wait_state(key)
